@@ -17,10 +17,13 @@ OANDA_ACCOUNT  = os.environ.get("OANDA_ACCOUNT",   "")
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── OANDA LIVE PRICE ───────────────────────────────────────────────────────────
+# ── OANDA LIVE PRICE WITH CROSS-CHECK ─────────────────────────────────────────
 async def get_live_price() -> str:
-    """Get live XAU/USD price from OANDA first, fallback to gold-api"""
-    # Try OANDA first
+    """Get live XAU/USD price from OANDA + cross-check with gold-api"""
+    oanda_price = None
+    goldapi_price = None
+
+    # Fetch OANDA price
     if OANDA_TOKEN:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
@@ -29,22 +32,40 @@ async def get_live_price() -> str:
                     headers={"Authorization": f"Bearer {OANDA_TOKEN}"}
                 )
                 data = resp.json()
-                price = data["candles"][0]["mid"]["c"]
-                live = str(round(float(price), 3))
-                logger.info(f"OANDA live price: ${live}")
-                return live
+                oanda_price = round(float(data["candles"][0]["mid"]["c"]), 3)
+                logger.info(f"OANDA price: ${oanda_price}")
         except Exception as e:
-            logger.warning(f"OANDA price failed: {e}")
-    # Fallback: gold-api.io free tier
+            logger.warning(f"OANDA failed: {e}")
+
+    # Fetch gold-api price
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get("https://www.goldapi.io/api/XAU/USD", headers={"x-access-token": "goldapi-free"})
+            resp = await client.get(
+                "https://www.goldapi.io/api/XAU/USD",
+                headers={"x-access-token": "goldapi-free"}
+            )
             data = resp.json()
-            price = str(round(float(data.get("price", 0)), 2))
-            logger.info(f"GoldAPI price: ${price}")
-            return price
+            goldapi_price = round(float(data.get("price", 0)), 2)
+            logger.info(f"GoldAPI price: ${goldapi_price}")
     except Exception as e:
         logger.warning(f"GoldAPI failed: {e}")
+
+    # Cross-check both prices
+    if oanda_price and goldapi_price:
+        diff = abs(oanda_price - goldapi_price)
+        diff_pct = (diff / oanda_price) * 100
+        if diff_pct < 0.1:  # Within 0.1% = verified ✅
+            logger.info(f"Price verified ✅ OANDA:${oanda_price} GoldAPI:${goldapi_price} diff:{diff_pct:.3f}%")
+            return f"{oanda_price} ✅ verified (vs gold-api: {diff_pct:.3f}%)"
+        else:  # Prices differ — use OANDA but flag it
+            logger.warning(f"Price mismatch ⚠️ OANDA:${oanda_price} GoldAPI:${goldapi_price} diff:{diff_pct:.3f}%")
+            return f"{oanda_price} ⚠️ (gold-api shows ${goldapi_price})"
+
+    # Single source fallback
+    if oanda_price:
+        return f"{oanda_price} (OANDA only)"
+    if goldapi_price:
+        return f"{goldapi_price} (gold-api only)"
     return ""
 
 # ── EXTRACT JSON SAFELY ────────────────────────────────────────────────────────
@@ -231,7 +252,8 @@ def format_crosscheck(a: dict) -> str:
 # ── DETECT SIGNAL ──────────────────────────────────────────────────────────────
 def is_trading_signal(text: str) -> bool:
     keywords = ["buy","sell","entry","sl:","tp:","stop loss","take profit",
-                "xau","gold","signal","long","short","target","pips"]
+                "xau","gold","signal","long","short","target","pips",
+                "limit","breakout","support","resistance","bullish","bearish"]
     text_lower = text.lower()
     return sum(1 for k in keywords if k in text_lower) >= 1
 
@@ -342,39 +364,70 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
+
     text = update.message.text or update.message.caption or ""
+
+    # Debug logging — check Render logs to see what's coming in
+    logger.info(f"MSG: {text[:60]}")
+    logger.info(f"FWD_DATE:{update.message.forward_date} FWD_FROM:{update.message.forward_from} FWD_CHAT:{update.message.forward_from_chat} FWD_ORIGIN:{getattr(update.message,'forward_origin',None)}")
+
     if not text:
+        await update.message.reply_text("⚠️ Empty message received.")
         return
 
-is_forwarded = any([
-    update.message.forward_date is not None,
-    update.message.forward_from is not None,
-    update.message.forward_from_chat is not None,
-    getattr(update.message, 'forward_origin', None) is not None
-])
+    # Detect ALL Telegram forward types
+    is_forwarded = any([
+        update.message.forward_date is not None,
+        update.message.forward_from is not None,
+        update.message.forward_from_chat is not None,
+        getattr(update.message, "forward_origin", None) is not None,
+    ])
+
+    is_signal = is_trading_signal(text)
+    logger.info(f"is_forwarded:{is_forwarded} is_signal:{is_signal}")
 
     if is_forwarded or is_signal:
         msg = await update.message.reply_text(
-            "⏳ *Cross-referencing...*\n_Fetching live price + Multi-TF scoring_",
+            "⏳ *Cross-referencing signal...*\n_Fetching live price + Multi-TF scoring_",
             parse_mode="Markdown"
         )
         try:
             live_price = await get_live_price()
             today = datetime.now().strftime("%B %d, %Y %H:%M SGT")
-            price_context = f"\nToday: {today}\nLIVE XAU/USD from OANDA: ${live_price}" if live_price else f"\nToday: {today}\nGold ~$4,500-$5,000 in 2026"
+            price_context = (
+                f"\nToday: {today}\nLIVE XAU/USD from OANDA: ${live_price}"
+                if live_price else
+                f"\nToday: {today}\nGold ~$4,500-$5,000 in 2026. Do NOT use 2024 prices."
+            )
             prompt = build_crosscheck_prompt(text + price_context)
             try:
                 a = await claude_analysis(prompt)
-            except Exception:
+            except Exception as ce:
+                logger.warning(f"Claude failed: {ce} — using Gemini")
                 a = await gemini_analysis(prompt)
-            if live_price and abs(float(a.get("current_price","0").replace(",","")) - float(live_price)) > 500:
-                a["current_price"] = live_price
+            # Override wrong price
+            try:
+                if live_price:
+                    raw = float(live_price.split()[0])
+                    ai_p = float(a.get("current_price","0").replace(",",""))
+                    if abs(ai_p - raw) > 200:
+                        a["current_price"] = str(raw)
+            except Exception:
+                pass
             await msg.edit_text(format_crosscheck(a), parse_mode="Markdown")
         except Exception as e:
+            logger.error(f"Crosscheck error: {e}")
             await msg.edit_text(
-                f"❌ Cross-check failed.\nTry /signal for fresh analysis.\n`{str(e)[:150]}`",
+                f"❌ Cross-check failed.\nTry /quick for analysis.\n`{str(e)[:150]}`",
                 parse_mode="Markdown"
             )
+    else:
+        await update.message.reply_text(
+            "💬 No signal detected.\n\n"
+            "/signal — Full analysis\n"
+            "/quick — Fast analysis\n"
+            "Forward a signal to cross-check!"
+        )
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
