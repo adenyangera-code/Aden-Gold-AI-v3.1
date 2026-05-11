@@ -26,7 +26,7 @@ def extract_json(text: str) -> dict:
 
 # ── GEMINI FREE AI ─────────────────────────────────────────────────────────────
 async def gemini_analysis(prompt: str) -> dict:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
     async with httpx.AsyncClient(timeout=90) as client:
         resp = await client.post(url, json={
             "contents": [{"parts": [{"text": prompt}]}],
