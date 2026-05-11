@@ -3,7 +3,6 @@ import logging
 import json
 import httpx
 import os
-import re
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -12,28 +11,35 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
 ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_KEY",  "YOUR_CLAUDE_API_KEY_HERE")
 GEMINI_KEY     = os.environ.get("GEMINI_KEY",      "YOUR_GEMINI_API_KEY_HERE")
-CHAT_ID        = "@Aden_Yang"
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── GEMINI FREE ANALYSIS ───────────────────────────────────────────────────────
+# ── EXTRACT JSON SAFELY ────────────────────────────────────────────────────────
+def extract_json(text: str) -> dict:
+    text = text.replace("```json", "").replace("```", "").strip()
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start != -1 and end > start:
+        text = text[start:end]
+    return json.loads(text)
+
+# ── GEMINI FREE AI ─────────────────────────────────────────────────────────────
 async def gemini_analysis(prompt: str) -> dict:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}"
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=90) as client:
         resp = await client.post(url, json={
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.1}
         })
         data = resp.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-        clean = text.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean)
+        try:
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError) as e:
+            raise ValueError(f"Gemini error: {data.get('error', str(e))}")
+        return extract_json(text)
 
-# ── CLAUDE PREMIUM ANALYSIS ────────────────────────────────────────────────────
+# ── CLAUDE PREMIUM AI ──────────────────────────────────────────────────────────
 async def claude_analysis(prompt: str) -> dict:
     async with httpx.AsyncClient(timeout=90) as client:
         resp = await client.post(
@@ -51,465 +57,277 @@ async def claude_analysis(prompt: str) -> dict:
             }
         )
         data = resp.json()
-        text = "".join(
-            b["text"] for b in data.get("content", [])
-            if b.get("type") == "text"
-        )
-        clean = text.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean)
+        text = "".join(b["text"] for b in data.get("content", []) if b.get("type") == "text")
+        if not text:
+            raise ValueError("Claude returned empty response")
+        return extract_json(text)
 
-# ── FULL GOLD ANALYSIS PROMPT ──────────────────────────────────────────────────
-def build_analysis_prompt(extra_context=""):
+# ── ANALYSIS PROMPT ────────────────────────────────────────────────────────────
+def build_analysis_prompt(context=""):
     return f"""You are Aden Yang's professional gold trading AI.
 
-{extra_context}
+{context}
 
-Search for current XAU/USD data and analyse using these institutional-grade methods:
+Search the web for current XAU/USD data. Analyse using institutional methods:
 
-STEP 1 - MULTI-TIMEFRAME ANALYSIS:
-Search gold price on Weekly, Daily and 4H timeframes.
-Determine trend direction for each: bullish/bearish/neutral
+1. MULTI-TIMEFRAME: Weekly + Daily + 4H trends (bullish/bearish/neutral)
+2. KEY DATA: Gold price, DXY level+direction, Oil price, Iran news
+3. INDICATORS: RSI value+signal, MACD direction, Support/Resistance levels
+4. PATTERNS: Candlestick patterns, Higher/Lower highs, Fibonacci levels
+5. SCORING out of 100:
+   - Multi-TF aligned: 0-20
+   - DXY confirmed: 0-20
+   - RSI signal: 0-15
+   - Support/Resistance: 0-15
+   - News catalyst: 0-15
+   - Pattern found: 0-10
+   - External signal: 0-5
 
-STEP 2 - KEY DATA:
-- Current XAU/USD price
-- DXY US Dollar Index level and direction
-- WTI Oil price
-- Latest Iran-US war news (last 2 hours)
-- US Treasury 10yr yield
+RULES: Only BUY if 2+ TF bullish. Only SELL if 2+ TF bearish. WAIT if mixed or score below 60.
 
-STEP 3 - TECHNICAL INDICATORS:
-- RSI reading and signal (oversold <30 = bullish, overbought >70 = bearish)
-- MACD direction (bullish/bearish)
-- Price vs key support/resistance levels
-- Any candlestick patterns (hammer, shooting star, engulfing, doji)
+Return ONLY valid JSON, no markdown, no explanation:
+{{"price":"4700","signal":"BUY","entry":"4695","sl":"4680","tp1":"4720","tp2":"4745","rr":"1:2","session":"London","score_total":75,"score_multitf":15,"score_dxy":20,"score_rsi":10,"score_sr_level":15,"score_news":10,"score_pattern":5,"score_external":0,"weekly_trend":"bullish","daily_trend":"bullish","h4_trend":"neutral","rsi_value":"35","rsi_signal":"oversold","macd":"bullish","pattern_found":"hammer","dxy":"98.50","dxy_trend":"falling","oil":"104","iran_update":"Peace talks ongoing","key_support":"4680","key_resistance":"4750","fib_level":"4700 (38.2%)","reason":"DXY falling supports gold. RSI oversold at support.","risk_warning":"","trade_now":true}}"""
 
-STEP 4 - PATTERN RECOGNITION:
-- Higher highs/lows forming? (bullish trend)
-- Lower highs/lows forming? (bearish trend)
-- Price at support or resistance?
-- Any Fibonacci levels nearby?
-
-Return ONLY valid JSON (no markdown):
-{{
-  "price": "<current gold price>",
-  "signal": "BUY" or "SELL" or "WAIT",
-  "entry": "<price>",
-  "sl": "<price>",
-  "tp1": "<price>",
-  "tp2": "<price>",
-  "rr": "<ratio>",
-  "session": "Asian" or "London" or "New York" or "Overlap",
-  "score_total": <0-100>,
-  "score_multitf": <0-20>,
-  "score_dxy": <0-20>,
-  "score_rsi": <0-15>,
-  "score_sr_level": <0-15>,
-  "score_news": <0-15>,
-  "score_pattern": <0-10>,
-  "score_external": <0-5>,
-  "weekly_trend": "bullish" or "bearish" or "neutral",
-  "daily_trend": "bullish" or "bearish" or "neutral",
-  "h4_trend": "bullish" or "bearish" or "neutral",
-  "rsi_value": "<value>",
-  "rsi_signal": "oversold" or "overbought" or "neutral",
-  "macd": "bullish" or "bearish" or "neutral",
-  "pattern_found": "<pattern name or none>",
-  "dxy": "<level>",
-  "dxy_trend": "falling" or "rising" or "flat",
-  "oil": "<price>",
-  "iran_update": "<one line max 80 chars>",
-  "key_support": "<price>",
-  "key_resistance": "<price>",
-  "fib_level": "<nearest fib level or none>",
-  "news_filter": true or false,
-  "reason": "<2 sentences combining all analysis>",
-  "risk_warning": "<one line or empty>",
-  "trade_now": true or false
-}}"""
-
-# ── SIGNAL CROSS-CHECK PROMPT ──────────────────────────────────────────────────
-def build_crosscheck_prompt(forwarded_signal: str):
+# ── CROSS-CHECK PROMPT ─────────────────────────────────────────────────────────
+def build_crosscheck_prompt(signal_text: str):
     return f"""You are Aden Yang's professional gold trading AI.
 
-A trading signal has been forwarded from a Telegram signal channel.
-Here is the signal:
+A signal was forwarded from a Telegram channel:
+{signal_text}
 
-{forwarded_signal}
-
-TASK:
-1. Extract the signal details (direction, entry, SL, TP, source)
-2. Search for current gold price and market conditions
-3. Run your own multi-timeframe analysis
+Tasks:
+1. Extract: direction, entry, SL, TP, channel name
+2. Search current gold price and market conditions
+3. Run multi-timeframe analysis
 4. Cross-reference and give verdict
 
-Return ONLY valid JSON (no markdown):
-{{
-  "source_signal": {{
-    "direction": "BUY" or "SELL" or "WAIT",
-    "entry": "<price or unknown>",
-    "sl": "<price or unknown>",
-    "tp": "<price or unknown>",
-    "source_name": "<channel name>"
-  }},
-  "current_price": "<live gold price>",
-  "ai_direction": "BUY" or "SELL" or "WAIT",
-  "ai_agrees": true or false,
-  "confidence": <0-100>,
-  "score_total": <0-100>,
-  "score_multitf": <0-20>,
-  "score_dxy": <0-20>,
-  "score_rsi": <0-15>,
-  "score_sr_level": <0-15>,
-  "score_news": <0-15>,
-  "score_pattern": <0-10>,
-  "weekly_trend": "bullish" or "bearish" or "neutral",
-  "daily_trend": "bullish" or "bearish" or "neutral",
-  "h4_trend": "bullish" or "bearish" or "neutral",
-  "dxy": "<level>",
-  "dxy_trend": "falling" or "rising" or "flat",
-  "iran_update": "<one line>",
-  "rsi_value": "<value>",
-  "rsi_signal": "oversold" or "overbought" or "neutral",
-  "pattern_found": "<pattern or none>",
-  "verdict": "CONFIRMED" or "MIXED" or "REJECTED",
-  "recommended_entry": "<price>",
-  "recommended_sl": "<price>",
-  "recommended_tp1": "<price>",
-  "recommended_tp2": "<price>",
-  "recommended_rr": "<ratio>",
-  "reason": "<2 sentences>",
-  "risk_warning": "<one line or empty>"
-}}"""
+CONFIRMED = score>=70 AND AI agrees
+MIXED = score 50-69 OR partial agreement
+REJECTED = score<50 OR AI disagrees
 
-# ── FORMAT FULL SIGNAL ─────────────────────────────────────────────────────────
-def format_signal(a: dict, alert_type="SIGNAL") -> str:
-    e = {"BUY": "🟢", "SELL": "🔴", "WAIT": "🟡"}.get(a["signal"], "⚪")
-    dxy = "📉" if a["dxy_trend"] == "falling" else "📈" if a["dxy_trend"] == "rising" else "➡️"
-    tf_icon = lambda t: "🟢" if t == "bullish" else "🔴" if t == "bearish" else "🟡"
-    sess = {"Asian":"🌏","London":"🇬🇧","New York":"🇺🇸","Overlap":"⚡"}.get(a.get("session",""), "🕐")
-    time_str = datetime.now().strftime("%d %b %H:%M SGT")
+Return ONLY valid JSON, no markdown:
+{{"source_direction":"BUY","source_entry":"4700","source_sl":"4680","source_tp":"4730","source_name":"United Signals","current_price":"4705","ai_direction":"BUY","ai_agrees":true,"confidence":78,"score_total":78,"score_multitf":15,"score_dxy":20,"score_rsi":10,"score_sr_level":15,"score_news":10,"score_pattern":8,"weekly_trend":"bullish","daily_trend":"bullish","h4_trend":"bullish","dxy":"98.20","dxy_trend":"falling","iran_update":"Peace talks ongoing","rsi_value":"38","rsi_signal":"oversold","pattern_found":"none","verdict":"CONFIRMED","recommended_entry":"4700","recommended_sl":"4683","recommended_tp1":"4725","recommended_tp2":"4750","recommended_rr":"1:2","reason":"DXY falling and all timeframes bullish confirm buy signal.","risk_warning":""}}"""
 
-    score = a.get("score_total", 0)
-    score_bar = "█" * (score // 10) + "░" * (10 - score // 10)
+# ── FORMAT SIGNAL ──────────────────────────────────────────────────────────────
+def format_signal(a: dict, source="AI") -> str:
+    e = {"BUY":"🟢","SELL":"🔴","WAIT":"🟡"}.get(a.get("signal","WAIT"),"⚪")
+    d = "📉" if a.get("dxy_trend")=="falling" else "📈" if a.get("dxy_trend")=="rising" else "➡️"
+    ti = lambda t: "🟢" if t=="bullish" else "🔴" if t=="bearish" else "🟡"
+    si = {"Asian":"🌏","London":"🇬🇧","New York":"🇺🇸","Overlap":"⚡"}.get(a.get("session",""),"🕐")
+    ts = datetime.now().strftime("%d %b %H:%M SGT")
+    sc = a.get("score_total",0)
+    sb = "█"*(sc//10) + "░"*(10-sc//10)
 
-    if a["signal"] == "WAIT":
-        return f"""⚖️ *ADEN GOLD AI v3 — {alert_type}*
-━━━━━━━━━━━━━━━━━━━━━━
-🟡 *Signal: WAIT*
-💰 Gold: *${a["price"]}*
-{score_bar} {score}/100
+    if a.get("signal") == "WAIT":
+        return (
+            f"⚖️ *ADEN GOLD AI v3 — {source}*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🟡 *WAIT* | 💰 ${a.get('price','—')}\n{sb} {sc}/100\n"
+            f"{si} {a.get('session','—')}\n\n"
+            f"📊 *TF:* W:{ti(a.get('weekly_trend','neutral'))} D:{ti(a.get('daily_trend','neutral'))} 4H:{ti(a.get('h4_trend','neutral'))}\n\n"
+            f"📈 *Score:* MTF:{a.get('score_multitf',0)} DXY:{a.get('score_dxy',0)} RSI:{a.get('score_rsi',0)} S/R:{a.get('score_sr_level',0)} News:{a.get('score_news',0)} Pat:{a.get('score_pattern',0)}\n\n"
+            f"{d} DXY:{a.get('dxy','—')} | 🛢${a.get('oil','—')}\n"
+            f"📍 S:${a.get('key_support','—')} R:${a.get('key_resistance','—')}\n"
+            f"🌍 _{a.get('iran_update','—')}_\n💡 _{a.get('reason','—')}_\n⏰ {ts}"
+        )
 
-{sess} Session: {a.get("session","—")}
-
-📊 *Multi-Timeframe:*
-Weekly: {tf_icon(a["weekly_trend"])} {a["weekly_trend"].upper()}
-Daily:  {tf_icon(a["daily_trend"])} {a["daily_trend"].upper()}
-4H:     {tf_icon(a["h4_trend"])} {a["h4_trend"].upper()}
-
-📈 *Scoring Breakdown:*
-Multi-TF:  {a.get("score_multitf",0)}/20
-DXY:       {a.get("score_dxy",0)}/20
-RSI:       {a.get("score_rsi",0)}/15
-S/R Level: {a.get("score_sr_level",0)}/15
-News:      {a.get("score_news",0)}/15
-Pattern:   {a.get("score_pattern",0)}/10
-External:  {a.get("score_external",0)}/5
-
-{dxy} DXY: {a["dxy"]} ({a["dxy_trend"]})
-🛢 Oil: ${a["oil"]}
-🌍 Iran: _{a["iran_update"]}_
-📍 Support: ${a["key_support"]} | Resistance: ${a["key_resistance"]}
-
-💡 _{a["reason"]}_
-⏰ {time_str}"""
-
-    return f"""⚖️ *ADEN GOLD AI v3 — {alert_type}*
-━━━━━━━━━━━━━━━━━━━━━━
-{e} *Signal: {a["signal"]}*
-💰 Gold: *${a["price"]}*
-{score_bar} {score}/100
-
-{sess} Session: {a.get("session","—")}
-
-🎯 *SAR SETUP:*
-┌──────────────────────
-│ 📍 Entry:  `${a["entry"]}`
-│ 🛑 SL:     `${a["sl"]}` (max ~$9 at 2u)
-│ 🎯 TP1:    `${a["tp1"]}`
-│ 🏆 TP2:    `${a["tp2"]}`
-│ ⚖️ R:R:    `{a["rr"]}`
-└──────────────────────
-
-📊 *Multi-Timeframe:*
-Weekly: {tf_icon(a["weekly_trend"])} {a["weekly_trend"].upper()}
-Daily:  {tf_icon(a["daily_trend"])} {a["daily_trend"].upper()}
-4H:     {tf_icon(a["h4_trend"])} {a["h4_trend"].upper()}
-
-📈 *Scoring Breakdown:*
-Multi-TF:  {a.get("score_multitf",0)}/20 | DXY: {a.get("score_dxy",0)}/20
-RSI({a.get("rsi_value","—")}): {a.get("score_rsi",0)}/15 | S/R: {a.get("score_sr_level",0)}/15
-News: {a.get("score_news",0)}/15 | Pattern: {a.get("score_pattern",0)}/10
-🕯 Pattern: {a.get("pattern_found","none")}
-📐 Fib: {a.get("fib_level","none")}
-
-{dxy} DXY: {a["dxy"]} ({a["dxy_trend"]})
-🛢 Oil: ${a["oil"]}
-🌍 Iran: _{a["iran_update"]}_
-📍 S: ${a["key_support"]} | R: ${a["key_resistance"]}
-
-💡 _{a["reason"]}_
-{"⚠️ " + a.get("risk_warning","") if a.get("risk_warning") else ""}
-
-⏰ {time_str}
-━━━━━━━━━━━━━━━━━━━━━━
-✅ SL BEFORE entry | Max 2u
-✅ 2 losses = STOP | 0.7-1% target"""
+    return (
+        f"⚖️ *ADEN GOLD AI v3 — {source}*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{e} *{a.get('signal','—')}* | 💰 ${a.get('price','—')}\n{sb} {sc}/100\n"
+        f"{si} {a.get('session','—')}\n\n"
+        f"🎯 *SAR:*\n"
+        f"┌ 📍 Entry: `${a.get('entry','—')}`\n"
+        f"│ 🛑 SL:    `${a.get('sl','—')}`\n"
+        f"│ 🎯 TP1:   `${a.get('tp1','—')}`\n"
+        f"│ 🏆 TP2:   `${a.get('tp2','—')}`\n"
+        f"└ ⚖️ R:R:   `{a.get('rr','—')}`\n\n"
+        f"📊 *TF:* W:{ti(a.get('weekly_trend','neutral'))} {a.get('weekly_trend','—').upper()} | D:{ti(a.get('daily_trend','neutral'))} {a.get('daily_trend','—').upper()} | 4H:{ti(a.get('h4_trend','neutral'))} {a.get('h4_trend','—').upper()}\n\n"
+        f"📈 *Score {sc}/100:*\n"
+        f"MTF:{a.get('score_multitf',0)}/20 DXY:{a.get('score_dxy',0)}/20 RSI:{a.get('score_rsi',0)}/15\n"
+        f"S/R:{a.get('score_sr_level',0)}/15 News:{a.get('score_news',0)}/15 Pat:{a.get('score_pattern',0)}/10\n"
+        f"🕯 {a.get('pattern_found','none')} | 📐 {a.get('fib_level','none')}\n\n"
+        f"{d} DXY:{a.get('dxy','—')} ({a.get('dxy_trend','—')}) | 🛢${a.get('oil','—')}\n"
+        f"📍 S:${a.get('key_support','—')} R:${a.get('key_resistance','—')}\n"
+        f"🌍 _{a.get('iran_update','—')}_\n"
+        f"💡 _{a.get('reason','—')}_\n"
+        f"{'⚠️ '+a.get('risk_warning') if a.get('risk_warning') else ''}\n"
+        f"⏰ {ts}\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ SL before entry | Max 2u | 0.7-1% target"
+    )
 
 # ── FORMAT CROSS-CHECK ─────────────────────────────────────────────────────────
 def format_crosscheck(a: dict) -> str:
-    verdict_emoji = {"CONFIRMED": "✅", "MIXED": "⚠️", "REJECTED": "❌"}
-    v_e = verdict_emoji.get(a["verdict"], "❓")
-    src = a.get("source_signal", {})
-    ai_e = "🟢" if a["ai_direction"] == "BUY" else "🔴" if a["ai_direction"] == "SELL" else "🟡"
-    src_e = "🟢" if src.get("direction") == "BUY" else "🔴" if src.get("direction") == "SELL" else "🟡"
-    tf_icon = lambda t: "🟢" if t == "bullish" else "🔴" if t == "bearish" else "🟡"
-    dxy = "📉" if a["dxy_trend"] == "falling" else "📈" if a["dxy_trend"] == "rising" else "➡️"
-    score = a.get("score_total", 0)
-    score_bar = "█" * (score // 10) + "░" * (10 - score // 10)
-    time_str = datetime.now().strftime("%d %b %H:%M SGT")
+    ve = {"CONFIRMED":"✅","MIXED":"⚠️","REJECTED":"❌"}.get(a.get("verdict","MIXED"),"❓")
+    ae = "🟢" if a.get("ai_direction")=="BUY" else "🔴" if a.get("ai_direction")=="SELL" else "🟡"
+    se = "🟢" if a.get("source_direction")=="BUY" else "🔴" if a.get("source_direction")=="SELL" else "🟡"
+    ti = lambda t: "🟢" if t=="bullish" else "🔴" if t=="bearish" else "🟡"
+    d = "📉" if a.get("dxy_trend")=="falling" else "📈" if a.get("dxy_trend")=="rising" else "➡️"
+    sc = a.get("score_total",0)
+    sb = "█"*(sc//10) + "░"*(10-sc//10)
+    ts = datetime.now().strftime("%d %b %H:%M SGT")
 
-    return f"""⚖️ *SIGNAL CROSS-CHECK*
-━━━━━━━━━━━━━━━━━━━━━━
-{v_e} *Verdict: {a["verdict"]}*
-{score_bar} {a["confidence"]}% confidence
+    return (
+        f"⚖️ *SIGNAL CROSS-CHECK*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{ve} *{a.get('verdict','—')}* | {sb} {a.get('confidence',0)}%\n\n"
+        f"📨 *Source ({a.get('source_name','Unknown')}):*\n"
+        f"{se} {a.get('source_direction','—')} | Entry:${a.get('source_entry','—')} SL:${a.get('source_sl','—')} TP:${a.get('source_tp','—')}\n\n"
+        f"🤖 *AI Check:*\n"
+        f"{ae} {a.get('ai_direction','—')} | Agrees:{'✅' if a.get('ai_agrees') else '❌'} | Now:${a.get('current_price','—')}\n\n"
+        f"📊 *TF:* W:{ti(a.get('weekly_trend','neutral'))} {a.get('weekly_trend','—').upper()} | D:{ti(a.get('daily_trend','neutral'))} {a.get('daily_trend','—').upper()} | 4H:{ti(a.get('h4_trend','neutral'))} {a.get('h4_trend','—').upper()}\n\n"
+        f"📈 *Score {sc}/100:*\n"
+        f"MTF:{a.get('score_multitf',0)}/20 DXY:{a.get('score_dxy',0)}/20 RSI:{a.get('score_rsi',0)}/15\n"
+        f"S/R:{a.get('score_sr_level',0)}/15 News:{a.get('score_news',0)}/15 Pat:{a.get('score_pattern',0)}/10\n"
+        f"🕯 {a.get('pattern_found','none')}\n\n"
+        f"{d} DXY:{a.get('dxy','—')} | 🌍 _{a.get('iran_update','—')}_\n\n"
+        f"🎯 *Recommended SAR:*\n"
+        f"┌ 📍 Entry: `${a.get('recommended_entry','—')}`\n"
+        f"│ 🛑 SL:    `${a.get('recommended_sl','—')}` ✅\n"
+        f"│ 🎯 TP1:   `${a.get('recommended_tp1','—')}`\n"
+        f"│ 🏆 TP2:   `${a.get('recommended_tp2','—')}`\n"
+        f"└ ⚖️ R:R:   `{a.get('recommended_rr','—')}`\n\n"
+        f"💡 _{a.get('reason','—')}_\n"
+        f"{'⚠️ '+a.get('risk_warning') if a.get('risk_warning') else ''}\n"
+        f"⏰ {ts}\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ SL before entry | Max 2u | 0.7-1% target"
+    )
 
-📨 *Source Signal ({src.get("source_name","Unknown")}):*
-{src_e} Direction: {src.get("direction","—")}
-Entry: `${src.get("entry","—")}` | SL: `${src.get("sl","—")}` | TP: `${src.get("tp","—")}`
-
-🤖 *AI Verification:*
-{ai_e} AI says: {a["ai_direction"]}
-Agrees: {"✅ YES" if a["ai_agrees"] else "❌ NO"}
-Gold now: ${a["current_price"]}
-
-📊 *Multi-Timeframe:*
-Weekly: {tf_icon(a["weekly_trend"])} {a["weekly_trend"].upper()}
-Daily:  {tf_icon(a["daily_trend"])} {a["daily_trend"].upper()}
-4H:     {tf_icon(a["h4_trend"])} {a["h4_trend"].upper()}
-
-📈 *Score: {score}/100*
-Multi-TF: {a.get("score_multitf",0)}/20 | DXY: {a.get("score_dxy",0)}/20
-RSI({a.get("rsi_value","—")}): {a.get("score_rsi",0)}/15 | S/R: {a.get("score_sr_level",0)}/15
-News: {a.get("score_news",0)}/15 | Pattern: {a.get("score_pattern",0)}/10
-🕯 Pattern: {a.get("pattern_found","none")}
-
-{dxy} DXY: {a["dxy"]} ({a["dxy_trend"]})
-🌍 _{a["iran_update"]}_
-
-🎯 *Recommended SAR:*
-┌──────────────────────
-│ 📍 Entry: `${a["recommended_entry"]}`
-│ 🛑 SL:    `${a["recommended_sl"]}` ✅
-│ 🎯 TP1:   `${a["recommended_tp1"]}`
-│ 🏆 TP2:   `${a["recommended_tp2"]}`
-│ ⚖️ R:R:   `{a["recommended_rr"]}`
-└──────────────────────
-
-💡 _{a["reason"]}_
-{"⚠️ " + a.get("risk_warning","") if a.get("risk_warning") else ""}
-
-⏰ {time_str}
-━━━━━━━━━━━━━━━━━━━━━━
-✅ SL BEFORE entry | Max 2u | 0.7-1% target"""
-
-# ── DETECT IF MESSAGE IS A TRADING SIGNAL ─────────────────────────────────────
+# ── DETECT SIGNAL ──────────────────────────────────────────────────────────────
 def is_trading_signal(text: str) -> bool:
-    keywords = [
-        "buy", "sell", "entry", "sl:", "tp:", "stop loss", "take profit",
-        "xau", "gold", "usd/jpy", "signal", "long", "short",
-        "bid", "ask", "limit", "target"
-    ]
+    keywords = ["buy","sell","entry","sl:","tp:","stop loss","take profit",
+                "xau","gold","signal","long","short","target","pips"]
     text_lower = text.lower()
-    matches = sum(1 for k in keywords if k in text_lower)
-    return matches >= 2
+    return sum(1 for k in keywords if k in text_lower) >= 2
 
 # ── COMMANDS ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚖️ *ADEN GOLD AI BOT v3.0*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 Institutional-grade AI Analysis\n"
-        "📊 Multi-timeframe + Pattern Recognition\n"
-        "🔄 Cross-reference Free Signal Channels\n"
-        "📡 No auto checks — on demand only!\n\n"
+        "⚖️ *ADEN GOLD AI BOT v3.0*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📊 Multi-TF + Pattern + 100pt Scoring\n"
+        "🔄 Auto cross-reference any signal\n\n"
         "*Commands:*\n"
-        "/signal — Full AI analysis (Claude + multi-TF + scoring)\n"
-        "/quick — Fast free analysis (Gemini)\n"
-        "/crossref — Manual cross-reference\n"
+        "/signal — Full Claude analysis\n"
+        "/quick — Fast Gemini analysis (free)\n"
+        "/crossref — How to forward signals\n"
         "/rules — Trading rules\n"
         "/status — Bot status\n\n"
-        "*Auto Cross-Check:*\n"
-        "_Forward any signal from United Signals,\n"
-        "SureShotFX or FXPremiere — bot analyses\n"
-        "and replies CONFIRMED/MIXED/REJECTED!_\n\n"
-        "*Sources:* Claude AI + Gemini + Web Search",
+        "*Forward signals from:*\n"
+        "📊 United Signals\n📊 SureShotFX\n"
+        "📊 FXPremiere\n📊 Uncle Lim Journey\n\n"
+        "_Forward = instant cross-check!_ 💪",
         parse_mode="Markdown"
     )
 
 async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
-        "⏳ Running institutional-grade analysis...\n"
-        "_Multi-TF + Scoring + Pattern Recognition_",
+        "⏳ *Analysing with Claude AI...*\n_Multi-TF + Scoring + Patterns_",
         parse_mode="Markdown"
     )
     try:
-        prompt = build_analysis_prompt()
-        analysis = await claude_analysis(prompt)
-        await msg.edit_text(
-            format_signal(analysis, "CLAUDE ANALYSIS"),
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"Signal error: {e}")
+        a = await claude_analysis(build_analysis_prompt())
+        await msg.edit_text(format_signal(a, "CLAUDE"), parse_mode="Markdown")
+    except Exception as e1:
+        logger.error(f"Claude failed: {e1}")
         try:
-            prompt = build_analysis_prompt()
-            analysis = await gemini_analysis(prompt)
-            await msg.edit_text(
-                format_signal(analysis, "GEMINI ANALYSIS"),
-                parse_mode="Markdown"
-            )
+            a = await gemini_analysis(build_analysis_prompt())
+            await msg.edit_text(format_signal(a, "GEMINI"), parse_mode="Markdown")
         except Exception as e2:
-            await msg.edit_text(f"❌ Analysis failed: {str(e2)[:100]}")
+            await msg.edit_text(f"❌ Both APIs failed.\nCheck keys in Render.\n`{str(e2)[:150]}`", parse_mode="Markdown")
 
 async def cmd_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ Quick Gemini analysis...")
+    msg = await update.message.reply_text("⏳ *Gemini quick analysis...*", parse_mode="Markdown")
     try:
-        prompt = build_analysis_prompt()
-        analysis = await gemini_analysis(prompt)
-        await msg.edit_text(
-            format_signal(analysis, "GEMINI QUICK"),
-            parse_mode="Markdown"
-        )
+        a = await gemini_analysis(build_analysis_prompt())
+        await msg.edit_text(format_signal(a, "GEMINI"), parse_mode="Markdown")
     except Exception as e:
-        await msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        await msg.edit_text(f"❌ Gemini failed: {str(e)[:150]}\nTry /signal instead.", parse_mode="Markdown")
 
 async def cmd_crossref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📨 *How to use cross-reference:*\n\n"
-        "1. Open United Signals / SureShotFX / FXPremiere / Uncle Lim Journey\n"
-        "2. Long press any signal message\n"
-        "3. Tap *Forward*\n"
-        "4. Select *@AdenGoldAI_bot*\n"
-        "5. Bot analyses and replies instantly!\n\n"
-        "_Or paste any signal text directly here!_",
+        "📨 *Cross-Reference Guide:*\n\n"
+        "*Forward method:*\n"
+        "1. Open signal channel\n"
+        "2. Long press signal message\n"
+        "3. Tap Forward\n"
+        "4. Select @AdenGoldAI_bot ✅\n\n"
+        "*Paste method:*\n"
+        "Just paste signal text here!\n\n"
+        "*Results:*\n"
+        "✅ CONFIRMED = Trade it!\n"
+        "⚠️ MIXED = Be careful!\n"
+        "❌ REJECTED = Skip it!",
         parse_mode="Markdown"
     )
 
 async def cmd_rules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📋 *ADEN'S TRADING RULES v3*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📋 *ADEN'S TRADING RULES*\n━━━━━━━━━━━━━━━━━━━━━━\n"
         "★ SL BEFORE entry — always!\n"
-        "★ Max 2u at $1,500–$2,000 balance\n"
-        "★ Max SL = 15 pts (~$9 loss)\n"
-        "★ TP = 10–15 pts (small wins!)\n"
-        "★ Daily target = 0.7–1% only\n"
-        "★ 2 losses = STOP for the day\n"
-        "★ After target = LOG OFF!\n"
-        "★ Gold only — NO USD/JPY!\n"
-        "★ No trading before big news!\n"
-        "★ Score >= 70 before trading!\n\n"
-        "*SAR Method:*\n"
-        "SET → Limit order + SL + TP\n"
-        "ADJUST → TP1 hit: partial close 50%\n"
-        "RUN → Let rest go to TP2 free!\n\n"
-        "*Cross-Reference Rule:*\n"
-        "Only trade CONFIRMED signals!\n"
+        "★ Max 2u at $1,500-$2,000\n"
+        "★ Max SL = 15 pts (~$9)\n"
+        "★ TP = 10-15 pts only\n"
+        "★ Daily target = 0.7-1%\n"
+        "★ 2 losses = STOP today\n"
+        "★ Target hit = LOG OFF!\n"
+        "★ Gold only — no USD/JPY!\n"
+        "★ Score >= 70 to trade!\n\n"
+        "*SAR:* SET → ADJUST → RUN\n"
         "_Small profits beat big losses!_ 💪",
         parse_mode="Markdown"
     )
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"🤖 *BOT STATUS v3.0*\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"✅ Bot: Online\n"
-        f"📊 Mode: On-demand only\n"
-        f"🔄 Auto checks: Disabled (save cost)\n"
-        f"📡 Cross-check: Active\n"
-        f"🤖 Primary AI: Claude Haiku\n"
-        f"🆓 Backup AI: Gemini Flash\n"
-        f"📱 Signal channels:\n"
-        f"   • United Signals\n"
-        f"   • SureShotFX\n"
-        f"   • FXPremiere\n"
-        f"   • Uncle Lim Journey\n\n"
-        f"_Forward signals for instant analysis!_",
+        "🤖 *BOT STATUS v3.0*\n━━━━━━━━━━━━━━\n"
+        "✅ Online | 📊 On-demand mode\n"
+        "🤖 Claude Haiku + Gemini Flash\n"
+        "🔄 Auto cross-check: Active\n\n"
+        "*Channels:*\n"
+        "📊 United Signals\n"
+        "📊 SureShotFX\n"
+        "📊 FXPremiere\n"
+        "📊 Uncle Lim Journey",
         parse_mode="Markdown"
     )
 
-# ── AUTO CROSS-CHECK FORWARDED/PASTED SIGNALS ─────────────────────────────────
+# ── HANDLE FORWARDED / PASTED SIGNALS ─────────────────────────────────────────
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
-
     text = update.message.text or update.message.caption or ""
     if not text:
         return
 
-    # Check if forwarded or contains trading signal
     is_forwarded = update.message.forward_date is not None
     is_signal = is_trading_signal(text)
 
     if is_forwarded or is_signal:
         msg = await update.message.reply_text(
-            "⏳ *Cross-referencing signal...*\n"
-            "_Running multi-TF analysis + scoring_",
+            "⏳ *Cross-referencing...*\n_Analysing with multi-TF scoring_",
             parse_mode="Markdown"
         )
         try:
             prompt = build_crosscheck_prompt(text)
-            # Try Claude first for better accuracy
             try:
-                analysis = await claude_analysis(prompt)
+                a = await claude_analysis(prompt)
             except Exception:
-                analysis = await gemini_analysis(prompt)
-
-            await msg.edit_text(
-                format_crosscheck(analysis),
-                parse_mode="Markdown"
-            )
+                a = await gemini_analysis(prompt)
+            await msg.edit_text(format_crosscheck(a), parse_mode="Markdown")
         except Exception as e:
-            logger.error(f"Cross-check error: {e}")
             await msg.edit_text(
-                f"❌ Cross-check failed.\n"
-                f"Try /signal for fresh analysis.\n"
-                f"`{str(e)[:100]}`",
+                f"❌ Cross-check failed.\nTry /signal for fresh analysis.\n`{str(e)[:150]}`",
                 parse_mode="Markdown"
             )
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Commands
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("signal",   cmd_signal))
     app.add_handler(CommandHandler("quick",    cmd_quick))
-    
-    
     app.add_handler(CommandHandler("crossref", cmd_crossref))
     app.add_handler(CommandHandler("rules",    cmd_rules))
     app.add_handler(CommandHandler("status",   cmd_status))
-
-    # Auto cross-check forwarded messages and pasted signals
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        handle_message
-    ))
-
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("⚖️ Aden Gold AI Bot v3.0 started!")
-    logger.info("📡 Waiting for signals to cross-check...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
