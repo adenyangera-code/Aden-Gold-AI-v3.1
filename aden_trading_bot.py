@@ -68,6 +68,13 @@ async def get_live_price() -> str:
         return f"{goldapi_price} (gold-api only)"
     return ""
 
+def parse_price(live_price: str) -> float:
+    """Safely extract just the number from live_price string e.g. '4670.07 (OANDA only)' -> 4670.07"""
+    try:
+        return float(str(live_price).split()[0])
+    except Exception:
+        return 0.0
+
 # ── EXTRACT JSON SAFELY ────────────────────────────────────────────────────────
 def extract_json(text: str) -> dict:
     text = text.replace("```json", "").replace("```", "").strip()
@@ -78,19 +85,36 @@ def extract_json(text: str) -> dict:
     return json.loads(text)
 
 # ── GEMINI FREE AI ─────────────────────────────────────────────────────────────
-async def gemini_analysis(prompt: str) -> dict:
+async def gemini_analysis(prompt: str, retries: int = 2) -> dict:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
-    async with httpx.AsyncClient(timeout=90) as client:
-        resp = await client.post(url, json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.1}
-        })
-        data = resp.json()
+    for attempt in range(retries):
         try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError) as e:
-            raise ValueError(f"Gemini error: {data.get('error', str(e))}")
-        return extract_json(text)
+            async with httpx.AsyncClient(timeout=90) as client:
+                resp = await client.post(url, json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.1}
+                })
+                data = resp.json()
+                # Handle 503 overload — retry
+                if data.get("error", {}).get("code") == 503:
+                    logger.warning(f"Gemini 503 overload, attempt {attempt+1}/{retries}")
+                    if attempt < retries - 1:
+                        await asyncio.sleep(5)
+                        continue
+                    raise ValueError(f"Gemini error: {data.get('error')}")
+                try:
+                    text = data["candidates"][0]["content"]["parts"][0]["text"]
+                except (KeyError, IndexError) as e:
+                    raise ValueError(f"Gemini error: {data.get('error', str(e))}")
+                return extract_json(text)
+        except ValueError:
+            raise
+        except Exception as e:
+            if attempt < retries - 1:
+                await asyncio.sleep(3)
+                continue
+            raise
+    raise ValueError("Gemini failed after retries")
 
 # ── CLAUDE PREMIUM AI ──────────────────────────────────────────────────────────
 async def claude_analysis(prompt: str) -> dict:
@@ -285,7 +309,7 @@ async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         live_price = await get_live_price()
         prompt = build_analysis_prompt(live_price=live_price)
         a = await claude_analysis(prompt)
-        if live_price and abs(float(a.get("price","0").replace(",","")) - float(live_price)) > 500:
+        if live_price and abs(parse_price(a.get("price","0")) - parse_price(live_price)) > 500:
             a["price"] = live_price
         await msg.edit_text(format_signal(a, "CLAUDE"), parse_mode="Markdown")
     except Exception as e1:
@@ -294,7 +318,7 @@ async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             live_price = await get_live_price()
             prompt = build_analysis_prompt(live_price=live_price)
             a = await gemini_analysis(prompt)
-            if live_price and abs(float(a.get("price","0").replace(",","")) - float(live_price)) > 500:
+            if live_price and abs(parse_price(a.get("price","0")) - parse_price(live_price)) > 500:
                 a["price"] = live_price
             await msg.edit_text(format_signal(a, "GEMINI"), parse_mode="Markdown")
         except Exception as e2:
@@ -306,7 +330,7 @@ async def cmd_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         live_price = await get_live_price()
         prompt = build_analysis_prompt(live_price=live_price)
         a = await gemini_analysis(prompt)
-        if live_price and abs(float(a.get("price","0").replace(",","")) - float(live_price)) > 500:
+        if live_price and abs(parse_price(a.get("price","0")) - parse_price(live_price)) > 500:
             a["price"] = live_price
         await msg.edit_text(format_signal(a, "GEMINI"), parse_mode="Markdown")
     except Exception as e:
@@ -375,11 +399,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Empty message received.")
         return
 
-    # Detect ALL Telegram forward types
+    # Detect ALL Telegram forward types safely
     is_forwarded = any([
-        update.message.forward_date is not None,
-        update.message.forward_from is not None,
-        update.message.forward_from_chat is not None,
+        getattr(update.message, "forward_date", None) is not None,
+        getattr(update.message, "forward_from", None) is not None,
+        getattr(update.message, "forward_from_chat", None) is not None,
         getattr(update.message, "forward_origin", None) is not None,
     ])
 
@@ -408,8 +432,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # Override wrong price
             try:
                 if live_price:
-                    raw = float(live_price.split()[0])
-                    ai_p = float(a.get("current_price","0").replace(",",""))
+                    raw = parse_price(live_price)
+                    ai_p = parse_price(a.get("current_price","0"))
                     if abs(ai_p - raw) > 200:
                         a["current_price"] = str(raw)
             except Exception:
