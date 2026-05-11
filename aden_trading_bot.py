@@ -11,9 +11,41 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
 ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_KEY",  "YOUR_CLAUDE_API_KEY_HERE")
 GEMINI_KEY     = os.environ.get("GEMINI_KEY",      "YOUR_GEMINI_API_KEY_HERE")
+OANDA_TOKEN    = os.environ.get("OANDA_TOKEN",     "")
+OANDA_ACCOUNT  = os.environ.get("OANDA_ACCOUNT",   "")
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ── OANDA LIVE PRICE ───────────────────────────────────────────────────────────
+async def get_live_price() -> str:
+    """Get live XAU/USD price from OANDA first, fallback to gold-api"""
+    # Try OANDA first
+    if OANDA_TOKEN:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    "https://api-fxtrade.oanda.com/v3/instruments/XAU_USD/candles?count=1&granularity=S5&price=M",
+                    headers={"Authorization": f"Bearer {OANDA_TOKEN}"}
+                )
+                data = resp.json()
+                price = data["candles"][0]["mid"]["c"]
+                live = str(round(float(price), 3))
+                logger.info(f"OANDA live price: ${live}")
+                return live
+        except Exception as e:
+            logger.warning(f"OANDA price failed: {e}")
+    # Fallback: gold-api.io free tier
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get("https://www.goldapi.io/api/XAU/USD", headers={"x-access-token": "goldapi-free"})
+            data = resp.json()
+            price = str(round(float(data.get("price", 0)), 2))
+            logger.info(f"GoldAPI price: ${price}")
+            return price
+    except Exception as e:
+        logger.warning(f"GoldAPI failed: {e}")
+    return ""
 
 # ── EXTRACT JSON SAFELY ────────────────────────────────────────────────────────
 def extract_json(text: str) -> dict:
@@ -63,8 +95,14 @@ async def claude_analysis(prompt: str) -> dict:
         return extract_json(text)
 
 # ── ANALYSIS PROMPT ────────────────────────────────────────────────────────────
-def build_analysis_prompt(context=""):
+def build_analysis_prompt(context="", live_price=""):
+    today = datetime.now().strftime("%B %d, %Y %H:%M SGT")
+    price_hint = f"LIVE XAU/USD PRICE FROM OANDA: ${live_price}" if live_price else "Search web for current XAU/USD price (should be in $4,500-$5,000 range in 2026)"
     return f"""You are Aden Yang's professional gold trading AI.
+
+TODAY: {today}
+{price_hint}
+IMPORTANT: Gold is trading ~$4,500-$5,000 in 2026. Do NOT use 2024 prices ($2,000-$2,500).
 
 {context}
 
@@ -218,16 +256,24 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
-        "⏳ *Analysing with Claude AI...*\n_Multi-TF + Scoring + Patterns_",
+        "⏳ *Analysing with Claude AI...*\n_Fetching OANDA live price + Multi-TF + Scoring_",
         parse_mode="Markdown"
     )
     try:
-        a = await claude_analysis(build_analysis_prompt())
+        live_price = await get_live_price()
+        prompt = build_analysis_prompt(live_price=live_price)
+        a = await claude_analysis(prompt)
+        if live_price and abs(float(a.get("price","0").replace(",","")) - float(live_price)) > 500:
+            a["price"] = live_price
         await msg.edit_text(format_signal(a, "CLAUDE"), parse_mode="Markdown")
     except Exception as e1:
         logger.error(f"Claude failed: {e1}")
         try:
-            a = await gemini_analysis(build_analysis_prompt())
+            live_price = await get_live_price()
+            prompt = build_analysis_prompt(live_price=live_price)
+            a = await gemini_analysis(prompt)
+            if live_price and abs(float(a.get("price","0").replace(",","")) - float(live_price)) > 500:
+                a["price"] = live_price
             await msg.edit_text(format_signal(a, "GEMINI"), parse_mode="Markdown")
         except Exception as e2:
             await msg.edit_text(f"❌ Both APIs failed.\nCheck keys in Render.\n`{str(e2)[:150]}`", parse_mode="Markdown")
@@ -235,7 +281,11 @@ async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ *Gemini quick analysis...*", parse_mode="Markdown")
     try:
-        a = await gemini_analysis(build_analysis_prompt())
+        live_price = await get_live_price()
+        prompt = build_analysis_prompt(live_price=live_price)
+        a = await gemini_analysis(prompt)
+        if live_price and abs(float(a.get("price","0").replace(",","")) - float(live_price)) > 500:
+            a["price"] = live_price
         await msg.edit_text(format_signal(a, "GEMINI"), parse_mode="Markdown")
     except Exception as e:
         await msg.edit_text(f"❌ Gemini failed: {str(e)[:150]}\nTry /signal instead.", parse_mode="Markdown")
@@ -301,15 +351,20 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if is_forwarded or is_signal:
         msg = await update.message.reply_text(
-            "⏳ *Cross-referencing...*\n_Analysing with multi-TF scoring_",
+            "⏳ *Cross-referencing...*\n_Fetching live price + Multi-TF scoring_",
             parse_mode="Markdown"
         )
         try:
-            prompt = build_crosscheck_prompt(text)
+            live_price = await get_live_price()
+            today = datetime.now().strftime("%B %d, %Y %H:%M SGT")
+            price_context = f"\nToday: {today}\nLIVE XAU/USD from OANDA: ${live_price}" if live_price else f"\nToday: {today}\nGold ~$4,500-$5,000 in 2026"
+            prompt = build_crosscheck_prompt(text + price_context)
             try:
                 a = await claude_analysis(prompt)
             except Exception:
                 a = await gemini_analysis(prompt)
+            if live_price and abs(float(a.get("current_price","0").replace(",","")) - float(live_price)) > 500:
+                a["current_price"] = live_price
             await msg.edit_text(format_crosscheck(a), parse_mode="Markdown")
         except Exception as e:
             await msg.edit_text(
