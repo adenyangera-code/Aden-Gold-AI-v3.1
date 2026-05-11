@@ -393,7 +393,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Debug logging — check Render logs to see what's coming in
     logger.info(f"MSG: {text[:60]}")
-    logger.info(f"FWD_DATE:{update.message.forward_date} FWD_FROM:{update.message.forward_from} FWD_CHAT:{update.message.forward_from_chat} FWD_ORIGIN:{getattr(update.message,'forward_origin',None)}")
+    logger.info(f"FWD_DATE:{getattr(update.message,'forward_date',None)} FWD_FROM:{getattr(update.message,'forward_from',None)} FWD_CHAT:{getattr(update.message,'forward_from_chat',None)} FWD_ORIGIN:{getattr(update.message,'forward_origin',None)}")
 
     if not text:
         await update.message.reply_text("⚠️ Empty message received.")
