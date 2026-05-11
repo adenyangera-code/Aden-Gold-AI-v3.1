@@ -429,6 +429,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Forward a signal to cross-check!"
         )
 
+# ── ERROR HANDLER ──────────────────────────────────────────────────────────────
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Exception: {context.error}")
+    try:
+        if update and hasattr(update, "message") and update.message:
+            await update.message.reply_text(
+                f"⚠️ Bot error occurred.\nTry /quick or /signal again.\n`{str(context.error)[:100]}`",
+                parse_mode="Markdown"
+            )
+    except Exception:
+        pass
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -439,6 +451,7 @@ def main():
     app.add_handler(CommandHandler("rules",    cmd_rules))
     app.add_handler(CommandHandler("status",   cmd_status))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(error_handler)
     logger.info("⚖️ Aden Gold AI Bot v3.0 started!")
     app.run_polling(drop_pending_updates=True)
 
