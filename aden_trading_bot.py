@@ -233,7 +233,7 @@ def is_trading_signal(text: str) -> bool:
     keywords = ["buy","sell","entry","sl:","tp:","stop loss","take profit",
                 "xau","gold","signal","long","short","target","pips"]
     text_lower = text.lower()
-    return sum(1 for k in keywords if k in text_lower) >= 2
+    return sum(1 for k in keywords if k in text_lower) >= 1
 
 # ── COMMANDS ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -346,8 +346,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    is_forwarded = update.message.forward_date is not None
-    is_signal = is_trading_signal(text)
+is_forwarded = any([
+    update.message.forward_date is not None,
+    update.message.forward_from is not None,
+    update.message.forward_from_chat is not None,
+    getattr(update.message, 'forward_origin', None) is not None
+])
 
     if is_forwarded or is_signal:
         msg = await update.message.reply_text(
