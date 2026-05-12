@@ -4,6 +4,7 @@ import json
 import httpx
 import os
 import pytz
+import math
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -18,6 +19,226 @@ SGT            = pytz.timezone("Asia/Singapore")
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ── OANDA CANDLE FETCHER ───────────────────────────────────────────────────────
+async def fetch_candles(granularity: str, count: int = 100) -> list:
+    """Fetch OANDA candles for XAU_USD"""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"https://api-fxtrade.oanda.com/v3/instruments/XAU_USD/candles"
+                f"?granularity={granularity}&count={count}&price=M",
+                headers={"Authorization": f"Bearer {OANDA_TOKEN}"}
+            )
+            data = resp.json()
+            candles = data.get("candles", [])
+            # Return list of [open, high, low, close] floats
+            return [
+                {
+                    "o": float(c["mid"]["o"]),
+                    "h": float(c["mid"]["h"]),
+                    "l": float(c["mid"]["l"]),
+                    "c": float(c["mid"]["c"]),
+                    "complete": c.get("complete", True)
+                }
+                for c in candles if c.get("complete", True)
+            ]
+    except Exception as e:
+        logger.warning(f"OANDA candles {granularity} failed: {e}")
+        return []
+
+# ── TECHNICAL INDICATOR CALCULATIONS ──────────────────────────────────────────
+def calc_rsi(closes: list, period: int = 14) -> float:
+    """Calculate RSI from close prices"""
+    if len(closes) < period + 1:
+        return 50.0
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 2)
+
+def calc_ema(values: list, period: int) -> float:
+    """Calculate EMA"""
+    if len(values) < period:
+        return values[-1] if values else 0
+    k = 2 / (period + 1)
+    ema = sum(values[:period]) / period
+    for v in values[period:]:
+        ema = v * k + ema * (1 - k)
+    return round(ema, 3)
+
+def calc_macd(closes: list) -> dict:
+    """Calculate MACD (12,26,9)"""
+    if len(closes) < 26:
+        return {"macd": 0, "signal": 0, "hist": 0, "trend": "neutral"}
+    ema12 = calc_ema(closes, 12)
+    ema26 = calc_ema(closes, 26)
+    macd_line = ema12 - ema26
+    # Simple signal approximation
+    trend = "bullish" if macd_line > 0 else "bearish"
+    return {"macd": round(macd_line, 3), "trend": trend}
+
+def calc_support_resistance(candles: list) -> dict:
+    """Calculate key S/R from recent highs/lows"""
+    if not candles:
+        return {"support": 0, "resistance": 0}
+    highs = sorted([c["h"] for c in candles], reverse=True)
+    lows  = sorted([c["l"] for c in candles])
+    # Cluster top highs and low lows
+    resistance = round(sum(highs[:3]) / 3, 2)
+    support    = round(sum(lows[:3]) / 3, 2)
+    return {"support": support, "resistance": resistance}
+
+def detect_candle_pattern(candles: list) -> str:
+    """Detect common candlestick patterns on last candle"""
+    if len(candles) < 2:
+        return "none"
+    c = candles[-1]  # Last candle
+    p = candles[-2]  # Previous candle
+    body     = abs(c["c"] - c["o"])
+    rng      = c["h"] - c["l"]
+    upper    = c["h"] - max(c["c"], c["o"])
+    lower    = min(c["c"], c["o"]) - c["l"]
+
+    if rng == 0:
+        return "doji"
+
+    # Hammer (bullish reversal)
+    if lower > body * 2 and upper < body * 0.5 and c["c"] > c["o"]:
+        return "hammer (bullish)"
+
+    # Shooting star (bearish reversal)
+    if upper > body * 2 and lower < body * 0.5 and c["c"] < c["o"]:
+        return "shooting star (bearish)"
+
+    # Bullish engulfing
+    if c["c"] > c["o"] and p["c"] < p["o"] and c["c"] > p["o"] and c["o"] < p["c"]:
+        return "bullish engulfing"
+
+    # Bearish engulfing
+    if c["c"] < c["o"] and p["c"] > p["o"] and c["c"] < p["o"] and c["o"] > p["c"]:
+        return "bearish engulfing"
+
+    # Doji
+    if body < rng * 0.1:
+        return "doji (indecision)"
+
+    return "none"
+
+def get_trend(candles: list) -> str:
+    """Determine trend from candles using MA comparison"""
+    if len(candles) < 20:
+        return "neutral"
+    closes = [c["c"] for c in candles]
+    ma5  = sum(closes[-5:])  / 5
+    ma20 = sum(closes[-20:]) / 20
+    last = closes[-1]
+    if last > ma5 > ma20:
+        return "bullish"
+    elif last < ma5 < ma20:
+        return "bearish"
+    return "neutral"
+
+def calc_fibonacci(candles: list) -> dict:
+    """Calculate Fibonacci retracement levels"""
+    if not candles:
+        return {}
+    recent = candles[-50:] if len(candles) >= 50 else candles
+    high = max(c["h"] for c in recent)
+    low  = min(c["l"] for c in recent)
+    diff = high - low
+    current = candles[-1]["c"]
+    levels = {
+        "23.6%": round(high - diff * 0.236, 2),
+        "38.2%": round(high - diff * 0.382, 2),
+        "50.0%": round(high - diff * 0.500, 2),
+        "61.8%": round(high - diff * 0.618, 2),
+        "78.6%": round(high - diff * 0.786, 2),
+    }
+    # Find nearest level
+    nearest = min(levels.items(), key=lambda x: abs(x[1] - current))
+    return {"levels": levels, "nearest": f"{nearest[1]} ({nearest[0]})"}
+
+# ── FETCH ALL OANDA INDICATORS ─────────────────────────────────────────────────
+async def get_oanda_indicators() -> dict:
+    """Fetch real indicators from OANDA for all timeframes"""
+    if not OANDA_TOKEN:
+        return {}
+
+    logger.info("Fetching OANDA indicators for all TF...")
+
+    # Fetch candles for each timeframe in parallel
+    w_c, d_c, h4_c, h1_c, m15_c, m5_c = await asyncio.gather(
+        fetch_candles("W",   50),
+        fetch_candles("D",   100),
+        fetch_candles("H4",  100),
+        fetch_candles("H1",  100),
+        fetch_candles("M15", 100),
+        fetch_candles("M5",  50),
+        return_exceptions=True
+    )
+
+    # Safe fallback
+    def safe(v): return v if isinstance(v, list) else []
+    w_c, d_c, h4_c, h1_c, m15_c, m5_c = map(safe, [w_c, d_c, h4_c, h1_c, m15_c, m5_c])
+
+    # Calculate RSI on multiple timeframes
+    rsi_h1  = calc_rsi([c["c"] for c in h1_c])  if h1_c  else 50.0
+    rsi_m15 = calc_rsi([c["c"] for c in m15_c]) if m15_c else 50.0
+    rsi_m5  = calc_rsi([c["c"] for c in m5_c])  if m5_c  else 50.0
+
+    # MACD on H1 and M15
+    macd_h1  = calc_macd([c["c"] for c in h1_c])  if h1_c  else {"trend":"neutral"}
+    macd_m15 = calc_macd([c["c"] for c in m15_c]) if m15_c else {"trend":"neutral"}
+
+    # Trends per timeframe
+    trends = {
+        "weekly":  get_trend(w_c),
+        "daily":   get_trend(d_c),
+        "h4":      get_trend(h4_c),
+        "h1":      get_trend(h1_c),
+        "m15":     get_trend(m15_c),
+        "m5":      get_trend(m5_c),
+    }
+
+    # S/R from Daily candles
+    sr = calc_support_resistance(d_c[-30:]) if d_c else {"support":0,"resistance":0}
+
+    # Patterns from M15 and M5
+    pattern_m15 = detect_candle_pattern(m15_c) if m15_c else "none"
+    pattern_m5  = detect_candle_pattern(m5_c)  if m5_c  else "none"
+
+    # Fibonacci from Daily
+    fib = calc_fibonacci(d_c) if d_c else {}
+
+    # Current price
+    current_price = m5_c[-1]["c"] if m5_c else 0
+
+    result = {
+        "price":        round(current_price, 3),
+        "trends":       trends,
+        "rsi_h1":       rsi_h1,
+        "rsi_m15":      rsi_m15,
+        "rsi_m5":       rsi_m5,
+        "macd_h1":      macd_h1["trend"],
+        "macd_m15":     macd_m15["trend"],
+        "support":      sr["support"],
+        "resistance":   sr["resistance"],
+        "pattern_m15":  pattern_m15,
+        "pattern_m5":   pattern_m5,
+        "fib_nearest":  fib.get("nearest","none"),
+        "fib_levels":   fib.get("levels",{}),
+    }
+
+    logger.info(f"OANDA indicators: {result}")
+    return result
 
 # ── SGT TIMESTAMP ──────────────────────────────────────────────────────────────
 def sgt_now() -> str:
@@ -108,16 +329,18 @@ async def get_oil_price() -> str:
 
 # ── FETCH ALL LIVE DATA ────────────────────────────────────────────────────────
 async def get_all_live_data() -> dict:
-    gold, dxy, oil = await asyncio.gather(
+    gold, dxy, oil, indicators = await asyncio.gather(
         get_live_price(),
         get_dxy_price(),
         get_oil_price(),
+        get_oanda_indicators(),
         return_exceptions=True
     )
     return {
-        "gold": gold if isinstance(gold, str) else "",
-        "dxy":  dxy  if isinstance(dxy,  str) else "",
-        "oil":  oil  if isinstance(oil,  str) else "",
+        "gold":       gold       if isinstance(gold, str)  else "",
+        "dxy":        dxy        if isinstance(dxy,  str)  else "",
+        "oil":        oil        if isinstance(oil,  str)  else "",
+        "indicators": indicators if isinstance(indicators, dict) else {},
     }
 
 # ── EXTRACT JSON SAFELY ────────────────────────────────────────────────────────
@@ -185,10 +408,49 @@ async def claude_analysis(prompt: str) -> dict:
 
 # ── ANALYSIS PROMPT ────────────────────────────────────────────────────────────
 def build_analysis_prompt(live: dict) -> str:
-    today = sgt_full()
-    gold_hint  = f"LIVE XAU/USD (OANDA): ${live['gold']}" if live["gold"] else "Search web for current XAU/USD (~$4,500-$5,000 range in 2026)"
-    dxy_hint   = f"LIVE DXY (Yahoo Finance): {live['dxy']}" if live["dxy"] else "Search web for current DXY level"
-    oil_hint   = f"LIVE WTI OIL (Yahoo Finance): ${live['oil']}" if live["oil"] else "Search web for current WTI oil price"
+    today     = sgt_full()
+    ind       = live.get("indicators", {})
+    trends    = ind.get("trends", {})
+
+    gold_hint = f"LIVE XAU/USD (OANDA): ${live['gold']}" if live["gold"] else "Search web for current XAU/USD (~$4,500-$5,000 range in 2026)"
+    dxy_hint  = f"LIVE DXY (Yahoo Finance): {live['dxy']}" if live["dxy"] else "Search web for current DXY level"
+    oil_hint  = f"LIVE WTI OIL (Yahoo Finance): ${live['oil']}" if live["oil"] else "Search web for current WTI oil price"
+
+    # Build OANDA indicators context
+    oanda_context = ""
+    if ind:
+        oanda_context = f"""
+REAL-TIME OANDA CHART DATA (calculated from live candles):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Timeframe Trends (from OANDA candles):
+  Weekly:  {trends.get('weekly','neutral').upper()}
+  Daily:   {trends.get('daily','neutral').upper()}
+  4H:      {trends.get('h4','neutral').upper()}
+  1H:      {trends.get('h1','neutral').upper()}
+  15M:     {trends.get('m15','neutral').upper()}
+  5M:      {trends.get('m5','neutral').upper()}
+
+RSI (real calculated):
+  H1 RSI:  {ind.get('rsi_h1', 'n/a')}
+  15M RSI: {ind.get('rsi_m15', 'n/a')}
+  5M RSI:  {ind.get('rsi_m5', 'n/a')}
+
+MACD:
+  H1 MACD:  {ind.get('macd_h1', 'neutral')}
+  15M MACD: {ind.get('macd_m15', 'neutral')}
+
+Support/Resistance (from Daily candles):
+  Support:    ${ind.get('support', 'n/a')}
+  Resistance: ${ind.get('resistance', 'n/a')}
+
+Candlestick Patterns:
+  15M pattern: {ind.get('pattern_m15', 'none')}
+  5M pattern:  {ind.get('pattern_m5', 'none')}
+
+Fibonacci (nearest level): {ind.get('fib_nearest', 'none')}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+USE THE ABOVE OANDA DATA as primary analysis source.
+Only search web for: Iran news, DXY confirmation, Fed news."""
 
     return f"""You are Aden Yang's professional gold trading AI.
 
@@ -197,14 +459,14 @@ TODAY (Singapore Time): {today}
 {dxy_hint}
 {oil_hint}
 IMPORTANT: Gold is ~$4,500-$5,000 in 2026. Do NOT use 2024 prices ($2,000-$2,500).
+{oanda_context}
 
-Search the web for latest news and market conditions. Analyse using institutional methods:
+Search the web ONLY for: latest Iran-US news, Fed announcements, major events next 2 hours.
 
-1. MULTI-TIMEFRAME: Weekly + Daily + 4H trends (bullish/bearish/neutral)
-2. TECHNICAL: RSI value+signal, MACD, key Support/Resistance levels
-3. PATTERNS: Candlestick patterns, Higher/Lower highs, Fibonacci levels
-4. NEWS: Latest Iran-US update, Fed news, any major events next 2 hours
-5. SCORING out of 100:
+Using the OANDA data above + web news, determine:
+1. Overall signal direction (BUY/SELL/WAIT)
+2. Precise entry, SL, TP levels
+3. Confidence score out of 100:
    - Multi-TF aligned: 0-20
    - DXY confirmed: 0-20
    - RSI signal: 0-15
@@ -213,10 +475,14 @@ Search the web for latest news and market conditions. Analyse using institutiona
    - Pattern found: 0-10
    - External signal: 0-5
 
-RULES: Only BUY if 2+ TF bullish. Only SELL if 2+ TF bearish. WAIT if mixed or score below 60.
+RULES:
+- Only BUY if Weekly+Daily bullish AND 4H/1H neutral or bullish AND 15M turning bullish
+- Only SELL if Weekly+Daily bearish AND 4H/1H neutral or bearish AND 15M turning bearish
+- WAIT if mixed or score below 60
+- RSI >70 = overbought (avoid BUY) | RSI <30 = oversold (good BUY)
 
 Return ONLY valid JSON, no markdown:
-{{"price":"4700","signal":"BUY","entry":"4695","sl":"4680","tp1":"4720","tp2":"4745","rr":"1:2","session":"London","score_total":75,"score_multitf":15,"score_dxy":20,"score_rsi":10,"score_sr_level":15,"score_news":10,"score_pattern":5,"score_external":0,"weekly_trend":"bullish","daily_trend":"bullish","h4_trend":"neutral","rsi_value":"35","rsi_signal":"oversold","macd":"bullish","pattern_found":"hammer","dxy":"98.50","dxy_trend":"falling","oil":"104","iran_update":"Peace talks ongoing","key_support":"4680","key_resistance":"4750","fib_level":"4700 (38.2%)","reason":"DXY falling supports gold. RSI oversold at support.","risk_warning":"","trade_now":true}}"""
+{{"price":"4700","signal":"BUY","entry":"4695","sl":"4680","tp1":"4720","tp2":"4745","rr":"1:2","session":"London","score_total":75,"score_multitf":15,"score_dxy":20,"score_rsi":10,"score_sr_level":15,"score_news":10,"score_pattern":5,"score_external":0,"weekly_trend":"bullish","daily_trend":"bullish","h4_trend":"neutral","h1_trend":"bullish","m15_trend":"bullish","m5_trend":"bullish","rsi_value":"35","rsi_signal":"oversold","macd":"bullish","pattern_found":"hammer","dxy":"98.50","dxy_trend":"falling","oil":"104","iran_update":"Peace talks ongoing","key_support":"4680","key_resistance":"4750","fib_level":"4700 (38.2%)","reason":"OANDA 15M RSI oversold at support. All TF aligned bullish.","risk_warning":"","trade_now":true}}"""
 
 # ── CROSS-CHECK PROMPT ─────────────────────────────────────────────────────────
 def build_crosscheck_prompt(signal_text: str, live: dict) -> str:
@@ -265,7 +531,10 @@ def format_signal(a: dict, source="AI") -> str:
             f"{si} {a.get('session','—')}\n\n"
             f"📊 *TF:* W:{ti(a.get('weekly_trend','neutral'))} {a.get('weekly_trend','—').upper()} | "
             f"D:{ti(a.get('daily_trend','neutral'))} {a.get('daily_trend','—').upper()} | "
-            f"4H:{ti(a.get('h4_trend','neutral'))} {a.get('h4_trend','—').upper()}\n\n"
+            f"4H:{ti(a.get('h4_trend','neutral'))} {a.get('h4_trend','—').upper()}\n"
+            f"1H:{ti(a.get('h1_trend','neutral'))} {a.get('h1_trend','—').upper()} | "
+            f"15M:{ti(a.get('m15_trend','neutral'))} {a.get('m15_trend','—').upper()} | "
+            f"5M:{ti(a.get('m5_trend','neutral'))} {a.get('m5_trend','—').upper()}\n\n"
             f"📈 *Score {sc}/100:*\n"
             f"MTF:{a.get('score_multitf',0)}/20 DXY:{a.get('score_dxy',0)}/20 RSI:{a.get('score_rsi',0)}/15\n"
             f"S/R:{a.get('score_sr_level',0)}/15 News:{a.get('score_news',0)}/15 Pat:{a.get('score_pattern',0)}/10\n\n"
@@ -288,7 +557,10 @@ def format_signal(a: dict, source="AI") -> str:
         f"└ ⚖️  R:R:   `{a.get('rr','—')}`\n\n"
         f"📊 *TF:* W:{ti(a.get('weekly_trend','neutral'))} {a.get('weekly_trend','—').upper()} | "
         f"D:{ti(a.get('daily_trend','neutral'))} {a.get('daily_trend','—').upper()} | "
-        f"4H:{ti(a.get('h4_trend','neutral'))} {a.get('h4_trend','—').upper()}\n\n"
+        f"4H:{ti(a.get('h4_trend','neutral'))} {a.get('h4_trend','—').upper()}\n"
+        f"1H:{ti(a.get('h1_trend','neutral'))} {a.get('h1_trend','—').upper()} | "
+        f"15M:{ti(a.get('m15_trend','neutral'))} {a.get('m15_trend','—').upper()} | "
+        f"5M:{ti(a.get('m5_trend','neutral'))} {a.get('m5_trend','—').upper()}\n\n"
         f"📈 *Score {sc}/100:*\n"
         f"MTF:{a.get('score_multitf',0)}/20 DXY:{a.get('score_dxy',0)}/20 RSI:{a.get('score_rsi',0)}/15\n"
         f"S/R:{a.get('score_sr_level',0)}/15 News:{a.get('score_news',0)}/15 Pat:{a.get('score_pattern',0)}/10\n"
@@ -324,7 +596,10 @@ def format_crosscheck(a: dict) -> str:
         f"Now:${a.get('current_price','—')}\n\n"
         f"📊 *TF:* W:{ti(a.get('weekly_trend','neutral'))} {a.get('weekly_trend','—').upper()} | "
         f"D:{ti(a.get('daily_trend','neutral'))} {a.get('daily_trend','—').upper()} | "
-        f"4H:{ti(a.get('h4_trend','neutral'))} {a.get('h4_trend','—').upper()}\n\n"
+        f"4H:{ti(a.get('h4_trend','neutral'))} {a.get('h4_trend','—').upper()}\n"
+        f"1H:{ti(a.get('h1_trend','neutral'))} {a.get('h1_trend','—').upper()} | "
+        f"15M:{ti(a.get('m15_trend','neutral'))} {a.get('m15_trend','—').upper()} | "
+        f"5M:{ti(a.get('m5_trend','neutral'))} {a.get('m5_trend','—').upper()}\n\n"
         f"📈 *Score {sc}/100:*\n"
         f"MTF:{a.get('score_multitf',0)}/20 DXY:{a.get('score_dxy',0)}/20 RSI:{a.get('score_rsi',0)}/15\n"
         f"S/R:{a.get('score_sr_level',0)}/15 News:{a.get('score_news',0)}/15 Pat:{a.get('score_pattern',0)}/10\n"
