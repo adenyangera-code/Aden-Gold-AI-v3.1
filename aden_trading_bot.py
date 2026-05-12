@@ -3,6 +3,7 @@ import logging
 import json
 import httpx
 import os
+import pytz
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -13,17 +14,23 @@ ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_KEY",  "YOUR_CLAUDE_API_KEY_HERE")
 GEMINI_KEY     = os.environ.get("GEMINI_KEY",      "YOUR_GEMINI_API_KEY_HERE")
 OANDA_TOKEN    = os.environ.get("OANDA_TOKEN",     "")
 OANDA_ACCOUNT  = os.environ.get("OANDA_ACCOUNT",   "")
+SGT            = pytz.timezone("Asia/Singapore")
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── OANDA LIVE PRICE WITH CROSS-CHECK ─────────────────────────────────────────
+# ── SGT TIMESTAMP ──────────────────────────────────────────────────────────────
+def sgt_now() -> str:
+    return datetime.now(SGT).strftime("%d %b %H:%M SGT")
+
+def sgt_full() -> str:
+    return datetime.now(SGT).strftime("%B %d, %Y %H:%M SGT")
+
+# ── LIVE GOLD PRICE (OANDA + gold-api cross-check) ────────────────────────────
 async def get_live_price() -> str:
-    """Get live XAU/USD price from OANDA + cross-check with gold-api"""
     oanda_price = None
     goldapi_price = None
 
-    # Fetch OANDA price
     if OANDA_TOKEN:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
@@ -37,7 +44,6 @@ async def get_live_price() -> str:
         except Exception as e:
             logger.warning(f"OANDA failed: {e}")
 
-    # Fetch gold-api price
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
@@ -50,18 +56,12 @@ async def get_live_price() -> str:
     except Exception as e:
         logger.warning(f"GoldAPI failed: {e}")
 
-    # Cross-check both prices
     if oanda_price and goldapi_price:
-        diff = abs(oanda_price - goldapi_price)
-        diff_pct = (diff / oanda_price) * 100
-        if diff_pct < 0.1:  # Within 0.1% = verified ✅
-            logger.info(f"Price verified ✅ OANDA:${oanda_price} GoldAPI:${goldapi_price} diff:{diff_pct:.3f}%")
+        diff_pct = (abs(oanda_price - goldapi_price) / oanda_price) * 100
+        if diff_pct < 0.1:
             return f"{oanda_price} ✅ verified (vs gold-api: {diff_pct:.3f}%)"
-        else:  # Prices differ — use OANDA but flag it
-            logger.warning(f"Price mismatch ⚠️ OANDA:${oanda_price} GoldAPI:${goldapi_price} diff:{diff_pct:.3f}%")
+        else:
             return f"{oanda_price} ⚠️ (gold-api shows ${goldapi_price})"
-
-    # Single source fallback
     if oanda_price:
         return f"{oanda_price} (OANDA only)"
     if goldapi_price:
@@ -69,11 +69,56 @@ async def get_live_price() -> str:
     return ""
 
 def parse_price(live_price: str) -> float:
-    """Safely extract just the number from live_price string e.g. '4670.07 (OANDA only)' -> 4670.07"""
     try:
         return float(str(live_price).split()[0])
     except Exception:
         return 0.0
+
+# ── LIVE DXY PRICE (Yahoo Finance) ────────────────────────────────────────────
+async def get_dxy_price() -> str:
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1m&range=1d",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            data = resp.json()
+            price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
+            logger.info(f"DXY price: {price}")
+            return str(round(float(price), 2))
+    except Exception as e:
+        logger.warning(f"DXY fetch failed: {e}")
+        return ""
+
+# ── LIVE OIL PRICE (Yahoo Finance) ────────────────────────────────────────────
+async def get_oil_price() -> str:
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://query1.finance.yahoo.com/v8/finance/chart/CL=F?interval=1m&range=1d",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            data = resp.json()
+            price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
+            logger.info(f"WTI Oil price: ${price}")
+            return str(round(float(price), 2))
+    except Exception as e:
+        logger.warning(f"Oil fetch failed: {e}")
+        return ""
+
+# ── FETCH ALL LIVE DATA ────────────────────────────────────────────────────────
+async def get_all_live_data() -> dict:
+    gold, dxy, oil = await asyncio.gather(
+        get_live_price(),
+        get_dxy_price(),
+        get_oil_price(),
+        return_exceptions=True
+    )
+    return {
+        "gold": gold if isinstance(gold, str) else "",
+        "dxy":  dxy  if isinstance(dxy,  str) else "",
+        "oil":  oil  if isinstance(oil,  str) else "",
+    }
 
 # ── EXTRACT JSON SAFELY ────────────────────────────────────────────────────────
 def extract_json(text: str) -> dict:
@@ -95,9 +140,8 @@ async def gemini_analysis(prompt: str, retries: int = 2) -> dict:
                     "generationConfig": {"temperature": 0.1}
                 })
                 data = resp.json()
-                # Handle 503 overload — retry
-                if data.get("error", {}).get("code") == 503:
-                    logger.warning(f"Gemini 503 overload, attempt {attempt+1}/{retries}")
+                if data.get("error", {}).get("code") in (503, 429):
+                    logger.warning(f"Gemini {data['error']['code']}, attempt {attempt+1}/{retries}")
                     if attempt < retries - 1:
                         await asyncio.sleep(5)
                         continue
@@ -105,7 +149,7 @@ async def gemini_analysis(prompt: str, retries: int = 2) -> dict:
                 try:
                     text = data["candidates"][0]["content"]["parts"][0]["text"]
                 except (KeyError, IndexError) as e:
-                    raise ValueError(f"Gemini error: {data.get('error', str(e))}")
+                    raise ValueError(f"Gemini parse error: {data.get('error', str(e))}")
                 return extract_json(text)
         except ValueError:
             raise
@@ -140,23 +184,26 @@ async def claude_analysis(prompt: str) -> dict:
         return extract_json(text)
 
 # ── ANALYSIS PROMPT ────────────────────────────────────────────────────────────
-def build_analysis_prompt(context="", live_price=""):
-    today = datetime.now().strftime("%B %d, %Y %H:%M SGT")
-    price_hint = f"LIVE XAU/USD PRICE FROM OANDA: ${live_price}" if live_price else "Search web for current XAU/USD price (should be in $4,500-$5,000 range in 2026)"
+def build_analysis_prompt(live: dict) -> str:
+    today = sgt_full()
+    gold_hint  = f"LIVE XAU/USD (OANDA): ${live['gold']}" if live["gold"] else "Search web for current XAU/USD (~$4,500-$5,000 range in 2026)"
+    dxy_hint   = f"LIVE DXY (Yahoo Finance): {live['dxy']}" if live["dxy"] else "Search web for current DXY level"
+    oil_hint   = f"LIVE WTI OIL (Yahoo Finance): ${live['oil']}" if live["oil"] else "Search web for current WTI oil price"
+
     return f"""You are Aden Yang's professional gold trading AI.
 
-TODAY: {today}
-{price_hint}
-IMPORTANT: Gold is trading ~$4,500-$5,000 in 2026. Do NOT use 2024 prices ($2,000-$2,500).
+TODAY (Singapore Time): {today}
+{gold_hint}
+{dxy_hint}
+{oil_hint}
+IMPORTANT: Gold is ~$4,500-$5,000 in 2026. Do NOT use 2024 prices ($2,000-$2,500).
 
-{context}
-
-Search the web for current XAU/USD data. Analyse using institutional methods:
+Search the web for latest news and market conditions. Analyse using institutional methods:
 
 1. MULTI-TIMEFRAME: Weekly + Daily + 4H trends (bullish/bearish/neutral)
-2. KEY DATA: Gold price, DXY level+direction, Oil price, Iran news
-3. INDICATORS: RSI value+signal, MACD direction, Support/Resistance levels
-4. PATTERNS: Candlestick patterns, Higher/Lower highs, Fibonacci levels
+2. TECHNICAL: RSI value+signal, MACD, key Support/Resistance levels
+3. PATTERNS: Candlestick patterns, Higher/Lower highs, Fibonacci levels
+4. NEWS: Latest Iran-US update, Fed news, any major events next 2 hours
 5. SCORING out of 100:
    - Multi-TF aligned: 0-20
    - DXY confirmed: 0-20
@@ -168,19 +215,29 @@ Search the web for current XAU/USD data. Analyse using institutional methods:
 
 RULES: Only BUY if 2+ TF bullish. Only SELL if 2+ TF bearish. WAIT if mixed or score below 60.
 
-Return ONLY valid JSON, no markdown, no explanation:
+Return ONLY valid JSON, no markdown:
 {{"price":"4700","signal":"BUY","entry":"4695","sl":"4680","tp1":"4720","tp2":"4745","rr":"1:2","session":"London","score_total":75,"score_multitf":15,"score_dxy":20,"score_rsi":10,"score_sr_level":15,"score_news":10,"score_pattern":5,"score_external":0,"weekly_trend":"bullish","daily_trend":"bullish","h4_trend":"neutral","rsi_value":"35","rsi_signal":"oversold","macd":"bullish","pattern_found":"hammer","dxy":"98.50","dxy_trend":"falling","oil":"104","iran_update":"Peace talks ongoing","key_support":"4680","key_resistance":"4750","fib_level":"4700 (38.2%)","reason":"DXY falling supports gold. RSI oversold at support.","risk_warning":"","trade_now":true}}"""
 
 # ── CROSS-CHECK PROMPT ─────────────────────────────────────────────────────────
-def build_crosscheck_prompt(signal_text: str):
+def build_crosscheck_prompt(signal_text: str, live: dict) -> str:
+    today = sgt_full()
+    gold_hint = f"LIVE XAU/USD (OANDA): ${live['gold']}" if live["gold"] else "Search for current gold price (~$4,500-$5,000 in 2026)"
+    dxy_hint  = f"LIVE DXY: {live['dxy']}" if live["dxy"] else "Search for current DXY"
+    oil_hint  = f"LIVE OIL: ${live['oil']}" if live["oil"] else "Search for current oil price"
+
     return f"""You are Aden Yang's professional gold trading AI.
+
+TODAY (Singapore Time): {today}
+{gold_hint}
+{dxy_hint}
+{oil_hint}
 
 A signal was forwarded from a Telegram channel:
 {signal_text}
 
 Tasks:
 1. Extract: direction, entry, SL, TP, channel name
-2. Search current gold price and market conditions
+2. Search latest market conditions
 3. Run multi-timeframe analysis
 4. Cross-reference and give verdict
 
@@ -193,24 +250,30 @@ Return ONLY valid JSON, no markdown:
 
 # ── FORMAT SIGNAL ──────────────────────────────────────────────────────────────
 def format_signal(a: dict, source="AI") -> str:
-    e = {"BUY":"🟢","SELL":"🔴","WAIT":"🟡"}.get(a.get("signal","WAIT"),"⚪")
-    d = "📉" if a.get("dxy_trend")=="falling" else "📈" if a.get("dxy_trend")=="rising" else "➡️"
+    e  = {"BUY":"🟢","SELL":"🔴","WAIT":"🟡"}.get(a.get("signal","WAIT"),"⚪")
+    d  = "📉" if a.get("dxy_trend")=="falling" else "📈" if a.get("dxy_trend")=="rising" else "➡️"
     ti = lambda t: "🟢" if t=="bullish" else "🔴" if t=="bearish" else "🟡"
     si = {"Asian":"🌏","London":"🇬🇧","New York":"🇺🇸","Overlap":"⚡"}.get(a.get("session",""),"🕐")
-    ts = datetime.now().strftime("%d %b %H:%M SGT")
-    sc = a.get("score_total",0)
+    sc = a.get("score_total", 0)
     sb = "█"*(sc//10) + "░"*(10-sc//10)
+    ts = sgt_now()
 
     if a.get("signal") == "WAIT":
         return (
             f"⚖️ *ADEN GOLD AI v3 — {source}*\n━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🟡 *WAIT* | 💰 ${a.get('price','—')}\n{sb} {sc}/100\n"
             f"{si} {a.get('session','—')}\n\n"
-            f"📊 *TF:* W:{ti(a.get('weekly_trend','neutral'))} D:{ti(a.get('daily_trend','neutral'))} 4H:{ti(a.get('h4_trend','neutral'))}\n\n"
-            f"📈 *Score:* MTF:{a.get('score_multitf',0)} DXY:{a.get('score_dxy',0)} RSI:{a.get('score_rsi',0)} S/R:{a.get('score_sr_level',0)} News:{a.get('score_news',0)} Pat:{a.get('score_pattern',0)}\n\n"
-            f"{d} DXY:{a.get('dxy','—')} | 🛢${a.get('oil','—')}\n"
+            f"📊 *TF:* W:{ti(a.get('weekly_trend','neutral'))} {a.get('weekly_trend','—').upper()} | "
+            f"D:{ti(a.get('daily_trend','neutral'))} {a.get('daily_trend','—').upper()} | "
+            f"4H:{ti(a.get('h4_trend','neutral'))} {a.get('h4_trend','—').upper()}\n\n"
+            f"📈 *Score {sc}/100:*\n"
+            f"MTF:{a.get('score_multitf',0)}/20 DXY:{a.get('score_dxy',0)}/20 RSI:{a.get('score_rsi',0)}/15\n"
+            f"S/R:{a.get('score_sr_level',0)}/15 News:{a.get('score_news',0)}/15 Pat:{a.get('score_pattern',0)}/10\n\n"
+            f"{d} DXY:{a.get('dxy','—')} ({a.get('dxy_trend','—')}) | 🛢${a.get('oil','—')}\n"
             f"📍 S:${a.get('key_support','—')} R:${a.get('key_resistance','—')}\n"
-            f"🌍 _{a.get('iran_update','—')}_\n💡 _{a.get('reason','—')}_\n⏰ {ts}"
+            f"🌍 _{a.get('iran_update','—')}_\n"
+            f"💡 _{a.get('reason','—')}_\n"
+            f"⏰ {ts}"
         )
 
     return (
@@ -222,8 +285,10 @@ def format_signal(a: dict, source="AI") -> str:
         f"│ 🛑 SL:    `${a.get('sl','—')}`\n"
         f"│ 🎯 TP1:   `${a.get('tp1','—')}`\n"
         f"│ 🏆 TP2:   `${a.get('tp2','—')}`\n"
-        f"└ ⚖️ R:R:   `{a.get('rr','—')}`\n\n"
-        f"📊 *TF:* W:{ti(a.get('weekly_trend','neutral'))} {a.get('weekly_trend','—').upper()} | D:{ti(a.get('daily_trend','neutral'))} {a.get('daily_trend','—').upper()} | 4H:{ti(a.get('h4_trend','neutral'))} {a.get('h4_trend','—').upper()}\n\n"
+        f"└ ⚖️  R:R:   `{a.get('rr','—')}`\n\n"
+        f"📊 *TF:* W:{ti(a.get('weekly_trend','neutral'))} {a.get('weekly_trend','—').upper()} | "
+        f"D:{ti(a.get('daily_trend','neutral'))} {a.get('daily_trend','—').upper()} | "
+        f"4H:{ti(a.get('h4_trend','neutral'))} {a.get('h4_trend','—').upper()}\n\n"
         f"📈 *Score {sc}/100:*\n"
         f"MTF:{a.get('score_multitf',0)}/20 DXY:{a.get('score_dxy',0)}/20 RSI:{a.get('score_rsi',0)}/15\n"
         f"S/R:{a.get('score_sr_level',0)}/15 News:{a.get('score_news',0)}/15 Pat:{a.get('score_pattern',0)}/10\n"
@@ -243,19 +308,23 @@ def format_crosscheck(a: dict) -> str:
     ae = "🟢" if a.get("ai_direction")=="BUY" else "🔴" if a.get("ai_direction")=="SELL" else "🟡"
     se = "🟢" if a.get("source_direction")=="BUY" else "🔴" if a.get("source_direction")=="SELL" else "🟡"
     ti = lambda t: "🟢" if t=="bullish" else "🔴" if t=="bearish" else "🟡"
-    d = "📉" if a.get("dxy_trend")=="falling" else "📈" if a.get("dxy_trend")=="rising" else "➡️"
-    sc = a.get("score_total",0)
+    d  = "📉" if a.get("dxy_trend")=="falling" else "📈" if a.get("dxy_trend")=="rising" else "➡️"
+    sc = a.get("score_total", 0)
     sb = "█"*(sc//10) + "░"*(10-sc//10)
-    ts = datetime.now().strftime("%d %b %H:%M SGT")
+    ts = sgt_now()
 
     return (
         f"⚖️ *SIGNAL CROSS-CHECK*\n━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{ve} *{a.get('verdict','—')}* | {sb} {a.get('confidence',0)}%\n\n"
         f"📨 *Source ({a.get('source_name','Unknown')}):*\n"
-        f"{se} {a.get('source_direction','—')} | Entry:${a.get('source_entry','—')} SL:${a.get('source_sl','—')} TP:${a.get('source_tp','—')}\n\n"
+        f"{se} {a.get('source_direction','—')} | Entry:${a.get('source_entry','—')} "
+        f"SL:${a.get('source_sl','—')} TP:${a.get('source_tp','—')}\n\n"
         f"🤖 *AI Check:*\n"
-        f"{ae} {a.get('ai_direction','—')} | Agrees:{'✅' if a.get('ai_agrees') else '❌'} | Now:${a.get('current_price','—')}\n\n"
-        f"📊 *TF:* W:{ti(a.get('weekly_trend','neutral'))} {a.get('weekly_trend','—').upper()} | D:{ti(a.get('daily_trend','neutral'))} {a.get('daily_trend','—').upper()} | 4H:{ti(a.get('h4_trend','neutral'))} {a.get('h4_trend','—').upper()}\n\n"
+        f"{ae} {a.get('ai_direction','—')} | Agrees:{'✅' if a.get('ai_agrees') else '❌'} | "
+        f"Now:${a.get('current_price','—')}\n\n"
+        f"📊 *TF:* W:{ti(a.get('weekly_trend','neutral'))} {a.get('weekly_trend','—').upper()} | "
+        f"D:{ti(a.get('daily_trend','neutral'))} {a.get('daily_trend','—').upper()} | "
+        f"4H:{ti(a.get('h4_trend','neutral'))} {a.get('h4_trend','—').upper()}\n\n"
         f"📈 *Score {sc}/100:*\n"
         f"MTF:{a.get('score_multitf',0)}/20 DXY:{a.get('score_dxy',0)}/20 RSI:{a.get('score_rsi',0)}/15\n"
         f"S/R:{a.get('score_sr_level',0)}/15 News:{a.get('score_news',0)}/15 Pat:{a.get('score_pattern',0)}/10\n"
@@ -266,26 +335,29 @@ def format_crosscheck(a: dict) -> str:
         f"│ 🛑 SL:    `${a.get('recommended_sl','—')}` ✅\n"
         f"│ 🎯 TP1:   `${a.get('recommended_tp1','—')}`\n"
         f"│ 🏆 TP2:   `${a.get('recommended_tp2','—')}`\n"
-        f"└ ⚖️ R:R:   `{a.get('recommended_rr','—')}`\n\n"
+        f"└ ⚖️  R:R:   `{a.get('recommended_rr','—')}`\n\n"
         f"💡 _{a.get('reason','—')}_\n"
         f"{'⚠️ '+a.get('risk_warning') if a.get('risk_warning') else ''}\n"
         f"⏰ {ts}\n━━━━━━━━━━━━━━━━━━━━━━\n"
         f"✅ SL before entry | Max 2u | 0.7-1% target"
     )
 
-# ── DETECT SIGNAL ──────────────────────────────────────────────────────────────
+# ── DETECT TRADING SIGNAL ──────────────────────────────────────────────────────
 def is_trading_signal(text: str) -> bool:
-    keywords = ["buy","sell","entry","sl:","tp:","stop loss","take profit",
-                "xau","gold","signal","long","short","target","pips",
-                "limit","breakout","support","resistance","bullish","bearish"]
-    text_lower = text.lower()
-    return sum(1 for k in keywords if k in text_lower) >= 1
+    keywords = [
+        "buy","sell","entry","sl:","tp:","stop loss","take profit",
+        "xau","gold","signal","long","short","target","pips",
+        "limit","breakout","support","resistance","bullish","bearish"
+    ]
+    return sum(1 for k in keywords if k in text.lower()) >= 1
 
 # ── COMMANDS ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚖️ *ADEN GOLD AI BOT v3.0*\n━━━━━━━━━━━━━━━━━━━━━━\n"
         "📊 Multi-TF + Pattern + 100pt Scoring\n"
+        "💰 Live: OANDA + gold-api + Yahoo Finance\n"
+        "⏰ Singapore Time (SGT) ✅\n"
         "🔄 Auto cross-reference any signal\n\n"
         "*Commands:*\n"
         "/signal — Full Claude analysis\n"
@@ -302,39 +374,55 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
-        "⏳ *Analysing with Claude AI...*\n_Fetching OANDA live price + Multi-TF + Scoring_",
+        "⏳ *Fetching live data + Claude analysis...*",
         parse_mode="Markdown"
     )
     try:
-        live_price = await get_live_price()
-        prompt = build_analysis_prompt(live_price=live_price)
-        a = await claude_analysis(prompt)
-        if live_price and abs(parse_price(a.get("price","0")) - parse_price(live_price)) > 500:
-            a["price"] = live_price
-        await msg.edit_text(format_signal(a, "CLAUDE"), parse_mode="Markdown")
-    except Exception as e1:
-        logger.error(f"Claude failed: {e1}")
+        live = await get_all_live_data()
+        logger.info(f"Live data: gold={live['gold']} dxy={live['dxy']} oil={live['oil']}")
+        prompt = build_analysis_prompt(live)
         try:
-            live_price = await get_live_price()
-            prompt = build_analysis_prompt(live_price=live_price)
+            a = await claude_analysis(prompt)
+        except Exception as e1:
+            logger.warning(f"Claude failed: {e1} — trying Gemini")
             a = await gemini_analysis(prompt)
-            if live_price and abs(parse_price(a.get("price","0")) - parse_price(live_price)) > 500:
-                a["price"] = live_price
-            await msg.edit_text(format_signal(a, "GEMINI"), parse_mode="Markdown")
-        except Exception as e2:
-            await msg.edit_text(f"❌ Both APIs failed.\nCheck keys in Render.\n`{str(e2)[:150]}`", parse_mode="Markdown")
+            source = "GEMINI"
+        else:
+            source = "CLAUDE"
+        # Override wrong gold price
+        if live["gold"]:
+            raw = parse_price(live["gold"])
+            if raw > 0 and abs(parse_price(a.get("price","0")) - raw) > 200:
+                a["price"] = str(raw)
+        await msg.edit_text(format_signal(a, source), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Signal error: {e}")
+        await msg.edit_text(
+            f"❌ Analysis failed.\nCheck API keys in Render.\n`{str(e)[:150]}`",
+            parse_mode="Markdown"
+        )
 
 async def cmd_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ *Gemini quick analysis...*", parse_mode="Markdown")
+    msg = await update.message.reply_text(
+        "⏳ *Fetching live data + Gemini analysis...*",
+        parse_mode="Markdown"
+    )
     try:
-        live_price = await get_live_price()
-        prompt = build_analysis_prompt(live_price=live_price)
+        live = await get_all_live_data()
+        logger.info(f"Live data: gold={live['gold']} dxy={live['dxy']} oil={live['oil']}")
+        prompt = build_analysis_prompt(live)
         a = await gemini_analysis(prompt)
-        if live_price and abs(parse_price(a.get("price","0")) - parse_price(live_price)) > 500:
-            a["price"] = live_price
+        if live["gold"]:
+            raw = parse_price(live["gold"])
+            if raw > 0 and abs(parse_price(a.get("price","0")) - raw) > 200:
+                a["price"] = str(raw)
         await msg.edit_text(format_signal(a, "GEMINI"), parse_mode="Markdown")
     except Exception as e:
-        await msg.edit_text(f"❌ Gemini failed: {str(e)[:150]}\nTry /signal instead.", parse_mode="Markdown")
+        logger.error(f"Quick error: {e}")
+        await msg.edit_text(
+            f"❌ Gemini failed: {str(e)[:150]}\nTry /signal instead.",
+            parse_mode="Markdown"
+        )
 
 async def cmd_crossref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -371,16 +459,19 @@ async def cmd_rules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ts = sgt_now()
     await update.message.reply_text(
-        "🤖 *BOT STATUS v3.0*\n━━━━━━━━━━━━━━\n"
-        "✅ Online | 📊 On-demand mode\n"
-        "🤖 Claude Haiku + Gemini Flash\n"
-        "🔄 Auto cross-check: Active\n\n"
-        "*Channels:*\n"
-        "📊 United Signals\n"
-        "📊 SureShotFX\n"
-        "📊 FXPremiere\n"
-        "📊 Uncle Lim Journey",
+        f"🤖 *BOT STATUS v3.0*\n━━━━━━━━━━━━━━\n"
+        f"✅ Online | ⏰ {ts}\n"
+        f"📊 On-demand mode\n"
+        f"💰 Live: OANDA + gold-api + Yahoo Finance\n"
+        f"🤖 Claude Haiku + Gemini Flash\n"
+        f"🔄 Cross-check: Active\n\n"
+        f"*Signal Channels:*\n"
+        f"📊 United Signals\n"
+        f"📊 SureShotFX\n"
+        f"📊 FXPremiere\n"
+        f"📊 Uncle Lim Journey",
         parse_mode="Markdown"
     )
 
@@ -390,10 +481,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text or update.message.caption or ""
-
-    # Debug logging — check Render logs to see what's coming in
-    logger.info(f"MSG: {text[:60]}")
-    logger.info(f"FWD_DATE:{getattr(update.message,'forward_date',None)} FWD_FROM:{getattr(update.message,'forward_from',None)} FWD_CHAT:{getattr(update.message,'forward_from_chat',None)} FWD_ORIGIN:{getattr(update.message,'forward_origin',None)}")
+    logger.info(f"MSG received: {text[:60]}")
 
     if not text:
         await update.message.reply_text("⚠️ Empty message received.")
@@ -406,38 +494,27 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         getattr(update.message, "forward_from_chat", None) is not None,
         getattr(update.message, "forward_origin", None) is not None,
     ])
-
     is_signal = is_trading_signal(text)
     logger.info(f"is_forwarded:{is_forwarded} is_signal:{is_signal}")
 
     if is_forwarded or is_signal:
         msg = await update.message.reply_text(
-            "⏳ *Cross-referencing signal...*\n_Fetching live price + Multi-TF scoring_",
+            "⏳ *Cross-referencing signal...*\n_Fetching live data + Multi-TF analysis_",
             parse_mode="Markdown"
         )
         try:
-            live_price = await get_live_price()
-            today = datetime.now().strftime("%B %d, %Y %H:%M SGT")
-            price_context = (
-                f"\nToday: {today}\nLIVE XAU/USD from OANDA: ${live_price}"
-                if live_price else
-                f"\nToday: {today}\nGold ~$4,500-$5,000 in 2026. Do NOT use 2024 prices."
-            )
-            prompt = build_crosscheck_prompt(text + price_context)
+            live = await get_all_live_data()
+            prompt = build_crosscheck_prompt(text, live)
             try:
                 a = await claude_analysis(prompt)
             except Exception as ce:
-                logger.warning(f"Claude failed: {ce} — using Gemini")
+                logger.warning(f"Claude failed in crosscheck: {ce}")
                 a = await gemini_analysis(prompt)
-            # Override wrong price
-            try:
-                if live_price:
-                    raw = parse_price(live_price)
-                    ai_p = parse_price(a.get("current_price","0"))
-                    if abs(ai_p - raw) > 200:
-                        a["current_price"] = str(raw)
-            except Exception:
-                pass
+            # Override wrong gold price
+            if live["gold"]:
+                raw = parse_price(live["gold"])
+                if raw > 0 and abs(parse_price(a.get("current_price","0")) - raw) > 200:
+                    a["current_price"] = str(raw)
             await msg.edit_text(format_crosscheck(a), parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Crosscheck error: {e}")
@@ -459,7 +536,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     try:
         if update and hasattr(update, "message") and update.message:
             await update.message.reply_text(
-                f"⚠️ Bot error occurred.\nTry /quick or /signal again.\n`{str(context.error)[:100]}`",
+                f"⚠️ Error occurred. Try /quick or /signal.\n`{str(context.error)[:100]}`",
                 parse_mode="Markdown"
             )
     except Exception:
@@ -477,6 +554,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
     logger.info("⚖️ Aden Gold AI Bot v3.0 started!")
+    logger.info(f"⏰ Current SGT: {sgt_now()}")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
