@@ -982,17 +982,37 @@ except Exception as e:
 await msg.edit_text(f”❌ Failed: {str(e)[:150]}”, parse_mode=“Markdown”)
 
 async def cmd_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-msg = await update.message.reply_text(“⏳ *Fetching live data + SMA + Gemini analysis…*”, parse_mode=“Markdown”)
+msg = await update.message.reply_text(
+“⏳ *Fetching live price + Gemini analysis…*”,
+parse_mode=“Markdown”
+)
 try:
-live = await get_all_live_data()
+# Fast fetch — gold + DXY + Oil only (no slow candle analysis)
+gold, dxy, oil = await asyncio.gather(
+get_live_price(), get_dxy_price(), get_oil_price(),
+return_exceptions=True
+)
+live = {
+“gold”: gold if isinstance(gold, str) else “”,
+“dxy”:  dxy  if isinstance(dxy,  str) else “”,
+“oil”:  oil  if isinstance(oil,  str) else “”,
+“sma”:  {“available”: False},
+}
 a = await gemini_analysis(build_analysis_prompt(live))
 if live[“gold”]:
 raw = parse_price(live[“gold”])
 if raw > 0 and abs(parse_price(a.get(“price”,“0”)) - raw) > 200:
 a[“price”] = str(raw)
-await msg.edit_text(format_signal(a, “GEMINI”, live.get(“sma”)), parse_mode=“Markdown”)
+await msg.edit_text(
+format_signal(a, “GEMINI”, None),
+parse_mode=“Markdown”
+)
 except Exception as e:
-await msg.edit_text(f”❌ Gemini failed: {str(e)[:150]}\nTry /signal instead.”, parse_mode=“Markdown”)
+logger.error(f”Quick error: {e}”)
+await msg.edit_text(
+f”❌ Gemini failed: {str(e)[:150]}\nTry /signal instead.”,
+parse_mode=“Markdown”
+)
 
 async def cmd_news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 msg = await update.message.reply_text(“⏳ *Fetching latest news…*”, parse_mode=“Markdown”)
