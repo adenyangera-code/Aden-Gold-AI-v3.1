@@ -64,10 +64,11 @@ def sgt_now() -> str:
 def sgt_full() -> str:
     return datetime.now(SGT).strftime("%B %d, %Y %H:%M SGT")
 
-# ── OANDA CANDLES + SMA ────────────────────────────────────────────────────────
-async def get_oanda_candles(count: int = 200, granularity: str = "H1") -> list:
+# ── OANDA CANDLES + FULL TECHNICAL INDICATORS ─────────────────────────────────
+async def get_oanda_candles(count: int = 250, granularity: str = "H1") -> dict:
+    """Fetch OANDA candles and return OHLC data"""
     if not OANDA_TOKEN:
-        return []
+        return {"closes": [], "highs": [], "lows": [], "opens": []}
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
@@ -76,110 +77,339 @@ async def get_oanda_candles(count: int = 200, granularity: str = "H1") -> list:
                 headers={"Authorization": f"Bearer {OANDA_TOKEN}"}
             )
             data = resp.json()
-            closes = [float(c["mid"]["c"]) for c in data.get("candles", []) if c.get("complete", True)]
-            return closes
+            candles = [c for c in data.get("candles", []) if c.get("complete", True)]
+            return {
+                "closes": [float(c["mid"]["c"]) for c in candles],
+                "highs":  [float(c["mid"]["h"]) for c in candles],
+                "lows":   [float(c["mid"]["l"]) for c in candles],
+                "opens":  [float(c["mid"]["o"]) for c in candles],
+            }
     except Exception as e:
         logger.warning(f"Candles failed: {e}")
-        return []
+        return {"closes": [], "highs": [], "lows": [], "opens": []}
 
-def calc_sma(closes: list, period: int) -> float:
-    if len(closes) < period:
+# ── INDICATOR CALCULATIONS ─────────────────────────────────────────────────────
+def calc_sma(data: list, period: int) -> float:
+    if len(data) < period:
         return 0.0
-    return sum(closes[-period:]) / period
+    return round(sum(data[-period:]) / period, 3)
 
-async def get_sma_analysis() -> dict:
-    closes = await get_oanda_candles(210, "H1")
+def calc_ema(data: list, period: int) -> list:
+    if len(data) < period:
+        return []
+    k = 2 / (period + 1)
+    ema = [sum(data[:period]) / period]
+    for price in data[period:]:
+        ema.append(price * k + ema[-1] * (1 - k))
+    return ema
+
+def calc_rsi(closes: list, period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains  = [d if d > 0 else 0 for d in deltas[-period:]]
+    losses = [-d if d < 0 else 0 for d in deltas[-period:]]
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 2)
+
+def calc_macd(closes: list) -> dict:
+    if len(closes) < 26:
+        return {"macd": 0, "signal": 0, "histogram": 0, "trend": "neutral"}
+    ema12 = calc_ema(closes, 12)
+    ema26 = calc_ema(closes, 26)
+    min_len = min(len(ema12), len(ema26))
+    macd_line = [ema12[-min_len+i] - ema26[-min_len+i] for i in range(min_len)]
+    signal_line = calc_ema(macd_line, 9) if len(macd_line) >= 9 else [0]
+    macd_val  = round(macd_line[-1], 3)
+    signal_val = round(signal_line[-1], 3)
+    hist = round(macd_val - signal_val, 3)
+    # Crossover
+    prev_hist = round(macd_line[-2] - signal_line[-2], 3) if len(macd_line) > 1 and len(signal_line) > 1 else hist
+    if hist > 0 and prev_hist <= 0:
+        trend = "BULLISH CROSSOVER"
+    elif hist < 0 and prev_hist >= 0:
+        trend = "BEARISH CROSSOVER"
+    elif macd_val > 0 and hist > 0:
+        trend = "bullish"
+    elif macd_val < 0 and hist < 0:
+        trend = "bearish"
+    else:
+        trend = "neutral"
+    return {"macd": macd_val, "signal": signal_val, "histogram": hist, "trend": trend}
+
+def calc_bollinger(closes: list, period: int = 20, std_dev: float = 2.0) -> dict:
+    if len(closes) < period:
+        return {"upper": 0, "middle": 0, "lower": 0, "position": "middle", "squeeze": False}
+    sma   = sum(closes[-period:]) / period
+    std   = (sum((x - sma) ** 2 for x in closes[-period:]) / period) ** 0.5
+    upper = round(sma + std_dev * std, 3)
+    lower = round(sma - std_dev * std, 3)
+    middle = round(sma, 3)
+    price = closes[-1]
+    band_width = upper - lower
+    if price >= upper * 0.999:
+        position = "AT UPPER BAND — overbought"
+    elif price <= lower * 1.001:
+        position = "AT LOWER BAND — oversold"
+    elif price > middle:
+        position = "above middle"
+    else:
+        position = "below middle"
+    squeeze = band_width < (middle * 0.01)  # Squeeze if bands < 1% of price
+    return {"upper": upper, "middle": middle, "lower": lower,
+            "position": position, "squeeze": squeeze, "bandwidth": round(band_width, 2)}
+
+def calc_fibonacci(highs: list, lows: list, lookback: int = 50) -> dict:
+    if len(highs) < lookback or len(lows) < lookback:
+        return {}
+    recent_high = max(highs[-lookback:])
+    recent_low  = min(lows[-lookback:])
+    diff = recent_high - recent_low
+    return {
+        "high": round(recent_high, 2),
+        "low":  round(recent_low, 2),
+        "fib_236": round(recent_high - 0.236 * diff, 2),
+        "fib_382": round(recent_high - 0.382 * diff, 2),
+        "fib_500": round(recent_high - 0.500 * diff, 2),
+        "fib_618": round(recent_high - 0.618 * diff, 2),
+        "fib_786": round(recent_high - 0.786 * diff, 2),
+    }
+
+def nearest_fib(price: float, fib: dict) -> str:
+    if not fib:
+        return "N/A"
+    levels = {
+        "23.6%": fib.get("fib_236", 0),
+        "38.2%": fib.get("fib_382", 0),
+        "50.0%": fib.get("fib_500", 0),
+        "61.8%": fib.get("fib_618", 0),
+        "78.6%": fib.get("fib_786", 0),
+    }
+    closest = min(levels.items(), key=lambda x: abs(x[1] - price))
+    dist = abs(closest[1] - price)
+    if dist < 15:
+        return f"${closest[1]} ({closest[0]}) ← NEAR!"
+    return f"${closest[1]} ({closest[0]})"
+
+def detect_candle_pattern(opens: list, highs: list, lows: list, closes: list) -> str:
+    if len(closes) < 3:
+        return "none"
+    o, h, l, c = opens[-1], highs[-1], lows[-1], closes[-1]
+    po, ph, pl, pc = opens[-2], highs[-2], lows[-2], closes[-2]
+    body = abs(c - o)
+    total_range = h - l if h != l else 0.001
+    upper_wick = h - max(c, o)
+    lower_wick = min(c, o) - l
+
+    # Doji
+    if body / total_range < 0.1:
+        return "doji (indecision)"
+    # Hammer (bullish)
+    if lower_wick > body * 2 and upper_wick < body * 0.5 and c > o:
+        return "hammer (bullish)"
+    # Shooting star (bearish)
+    if upper_wick > body * 2 and lower_wick < body * 0.5 and c < o:
+        return "shooting star (bearish)"
+    # Bullish engulfing
+    if c > o and pc < po and c > po and o < pc:
+        return "bullish engulfing ✅"
+    # Bearish engulfing
+    if c < o and pc > po and c < po and o > pc:
+        return "bearish engulfing ❌"
+    # Bullish candle
+    if c > o and body / total_range > 0.6:
+        return "strong bullish candle"
+    # Bearish candle
+    if c < o and body / total_range > 0.6:
+        return "strong bearish candle"
+    return "no clear pattern"
+
+# ── FULL TECHNICAL ANALYSIS ────────────────────────────────────────────────────
+async def get_technical_analysis() -> dict:
+    """Calculate all technical indicators from OANDA candles"""
+    candles = await get_oanda_candles(250, "H1")
+    closes = candles["closes"]
+    highs  = candles["highs"]
+    lows   = candles["lows"]
+    opens  = candles["opens"]
+
     if len(closes) < 50:
-        return {"available": False, "note": "Insufficient candle data"}
+        return {"available": False}
 
     price = closes[-1]
-    sma20  = round(calc_sma(closes, 20), 3)
-    sma50  = round(calc_sma(closes, 50), 3)
-    sma200 = round(calc_sma(closes, 200), 3) if len(closes) >= 200 else 0
-
-    # Previous values for crossover detection
     prev_price = closes[-2] if len(closes) >= 2 else price
-    prev_sma20 = round(calc_sma(closes[:-1], 20), 3) if len(closes) > 20 else sma20
 
-    # Price vs SMA
+    # ── SMA ──
+    sma20  = calc_sma(closes, 20)
+    sma50  = calc_sma(closes, 50)
+    sma200 = calc_sma(closes, 200) if len(closes) >= 200 else 0
+    prev_sma20 = calc_sma(closes[:-1], 20)
+    sma20_trend = "rising" if sma20 > calc_sma(closes[:-5], 20) else "falling"
+    sma50_trend = "rising" if sma50 > calc_sma(closes[:-5], 50) else "falling"
     above_sma20  = price > sma20
     above_sma50  = price > sma50
     above_sma200 = price > sma200 if sma200 > 0 else None
-
-    # Crossover detection
     crossed_above_sma20 = price > sma20 and prev_price <= prev_sma20
     crossed_below_sma20 = price < sma20 and prev_price >= prev_sma20
-
-    # SMA trend (rising or falling)
-    sma20_trend  = "rising" if sma20 > calc_sma(closes[:-5], 20) else "falling"
-    sma50_trend  = "rising" if sma50 > calc_sma(closes[:-5], 50) else "falling"
-
-    # False breakout detection
     false_breakout = crossed_below_sma20
 
-    # SMA Score (0-30)
-    score = 0
-    signal = "NEUTRAL"
+    # ── RSI ──
+    rsi = calc_rsi(closes, 14)
+    rsi14_prev = calc_rsi(closes[:-1], 14)
+    if rsi < 30:
+        rsi_signal = "OVERSOLD — BUY zone"
+        rsi_score = 15
+    elif rsi < 40:
+        rsi_signal = "oversold territory"
+        rsi_score = 10
+    elif rsi > 70:
+        rsi_signal = "OVERBOUGHT — caution"
+        rsi_score = 5
+    elif rsi > 60:
+        rsi_signal = "overbought territory"
+        rsi_score = 7
+    else:
+        rsi_signal = "neutral"
+        rsi_score = 5
+    rsi_trend = "rising" if rsi > rsi14_prev else "falling"
 
+    # ── MACD ──
+    macd = calc_macd(closes)
+
+    # ── Bollinger Bands ──
+    bb = calc_bollinger(closes, 20)
+
+    # ── Fibonacci ──
+    fib = calc_fibonacci(highs, lows, 50)
+    nearest = nearest_fib(price, fib)
+
+    # ── Candlestick Pattern ──
+    pattern = detect_candle_pattern(opens, highs, lows, closes)
+
+    # ── COMPOSITE SCORE ──
+    tech_score = 0
+    overall_signal = "NEUTRAL"
+
+    # SMA contribution
     if above_sma20 and above_sma50:
-        score += 15
-        signal = "BULLISH"
+        tech_score += 5
     elif not above_sma20 and not above_sma50:
-        score -= 10
-        signal = "BEARISH"
+        tech_score -= 5
+    if false_breakout:
+        tech_score -= 8
+    elif crossed_above_sma20:
+        tech_score += 3
 
-    if above_sma200:
-        score += 10
-        signal = "STRONG BULLISH"
-    elif above_sma200 == False:
-        score -= 5
-        signal = "BEARISH" if signal == "BEARISH" else signal
+    # RSI contribution
+    tech_score += rsi_score
 
-    if crossed_above_sma20:
-        score += 5
-        signal = "BULLISH CROSSOVER"
-    elif false_breakout:
-        score -= 15
-        signal = "FALSE BREAKOUT"
+    # MACD contribution
+    if "BULLISH" in macd["trend"].upper():
+        tech_score += 8
+    elif "BEARISH" in macd["trend"].upper():
+        tech_score -= 5
+    elif macd["trend"] == "bullish":
+        tech_score += 4
+
+    # Bollinger contribution
+    if "LOWER" in bb["position"].upper():
+        tech_score += 5
+    elif "UPPER" in bb["position"].upper():
+        tech_score -= 3
+
+    # Pattern contribution
+    if "bullish" in pattern.lower():
+        tech_score += 5
+    elif "bearish" in pattern.lower():
+        tech_score -= 3
+
+    # Overall signal
+    if tech_score >= 20:
+        overall_signal = "STRONG BUY"
+    elif tech_score >= 10:
+        overall_signal = "BUY"
+    elif tech_score <= -10:
+        overall_signal = "STRONG SELL"
+    elif tech_score <= -5:
+        overall_signal = "SELL"
+    else:
+        overall_signal = "NEUTRAL"
 
     # Warning
     warning = ""
     if false_breakout:
-        warning = "Price crossed above SMA20 then dropped below — FALSE BREAKOUT! Wait for confirmation."
-    elif crossed_above_sma20:
-        warning = "Fresh SMA20 crossover — monitor for confirmation."
+        warning = "FALSE BREAKOUT detected — price crossed above SMA20 then dropped below!"
+    elif crossed_above_sma20 and rsi > 65:
+        warning = "SMA crossover but RSI overbought — wait for pullback"
+    elif bb["squeeze"]:
+        warning = "Bollinger squeeze — big move incoming!"
 
     return {
         "available": True,
         "price": round(price, 3),
-        "sma20": sma20,
-        "sma50": sma50,
-        "sma200": sma200,
-        "above_sma20": above_sma20,
-        "above_sma50": above_sma50,
-        "above_sma200": above_sma200,
-        "sma20_trend": sma20_trend,
-        "sma50_trend": sma50_trend,
-        "crossed_above_sma20": crossed_above_sma20,
-        "false_breakout": false_breakout,
-        "signal": signal,
-        "sma_score": score,
+        # SMA
+        "sma20": sma20, "sma50": sma50, "sma200": sma200,
+        "above_sma20": above_sma20, "above_sma50": above_sma50, "above_sma200": above_sma200,
+        "sma20_trend": sma20_trend, "sma50_trend": sma50_trend,
+        "crossed_above_sma20": crossed_above_sma20, "false_breakout": false_breakout,
+        # RSI
+        "rsi": rsi, "rsi_signal": rsi_signal, "rsi_score": rsi_score, "rsi_trend": rsi_trend,
+        # MACD
+        "macd_value": macd["macd"], "macd_signal": macd["signal"],
+        "macd_hist": macd["histogram"], "macd_trend": macd["trend"],
+        # Bollinger
+        "bb_upper": bb["upper"], "bb_middle": bb["middle"], "bb_lower": bb["lower"],
+        "bb_position": bb["position"], "bb_squeeze": bb["squeeze"], "bb_bandwidth": bb["bandwidth"],
+        # Fibonacci
+        "fib": fib, "nearest_fib": nearest,
+        # Pattern
+        "pattern": pattern,
+        # Overall
+        "tech_score": tech_score,
+        "signal": overall_signal,
         "warning": warning,
     }
 
-def format_sma_block(s: dict) -> str:
-    if not s.get("available"):
-        return "_SMA data unavailable_"
+def format_tech_block(t: dict) -> str:
+    if not t.get("available"):
+        return "_Technical data unavailable — add OANDA_TOKEN to Render_"
+    trend_icon = lambda x: "📈" if x == "rising" else "📉"
     chk = lambda x: "✅" if x else "❌"
-    trend = lambda t: "📈" if t == "rising" else "📉"
+    macd_icon = "🟢" if "bullish" in t["macd_trend"].lower() else "🔴" if "bearish" in t["macd_trend"].lower() else "🟡"
+    rsi_icon = "🟢" if t["rsi"] < 40 else "🔴" if t["rsi"] > 65 else "🟡"
+    bb_icon = "🟢" if "LOWER" in t["bb_position"].upper() else "🔴" if "UPPER" in t["bb_position"].upper() else "🟡"
+
     return (
-        f"📊 *SMA Analysis (H1):*\n"
-        f"SMA20:  ${s['sma20']} {trend(s['sma20_trend'])} | Price {'above' if s['above_sma20'] else 'BELOW'} {chk(s['above_sma20'])}\n"
-        f"SMA50:  ${s['sma50']} {trend(s['sma50_trend'])} | Price {'above' if s['above_sma50'] else 'BELOW'} {chk(s['above_sma50'])}\n"
-        f"SMA200: ${s['sma200']} | Price {'above' if s['above_sma200'] else 'BELOW'} {chk(s['above_sma200'])}\n"
-        f"Signal: *{s['signal']}*\n"
-        f"{'⚠️ '+s['warning'] if s['warning'] else ''}"
+        f"📊 *LIVE TECHNICAL INDICATORS (H1):*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"*SMA:*\n"
+        f"20: ${t['sma20']} {trend_icon(t['sma20_trend'])} | {chk(t['above_sma20'])} above\n"
+        f"50: ${t['sma50']} {trend_icon(t['sma50_trend'])} | {chk(t['above_sma50'])} above\n"
+        f"200: ${t['sma200']} | {chk(t['above_sma200'])} above\n"
+        f"{'⚠️ FALSE BREAKOUT!' if t['false_breakout'] else '🟢 Fresh crossover!' if t['crossed_above_sma20'] else ''}\n\n"
+        f"*RSI (14):* {rsi_icon} {t['rsi']} {trend_icon(t['rsi_trend'])}\n"
+        f"_{t['rsi_signal']}_\n\n"
+        f"*MACD:* {macd_icon} {t['macd_trend'].upper()}\n"
+        f"MACD: {t['macd_value']} | Signal: {t['macd_signal']} | Hist: {t['macd_hist']}\n\n"
+        f"*Bollinger Bands:* {bb_icon}\n"
+        f"Upper: ${t['bb_upper']} | Mid: ${t['bb_middle']} | Lower: ${t['bb_lower']}\n"
+        f"_{t['bb_position']}_\n"
+        f"{'⚡ SQUEEZE — big move coming!' if t['bb_squeeze'] else ''}\n\n"
+        f"*Fibonacci (50-bar):*\n"
+        f"High: ${t['fib'].get('high','—')} | Low: ${t['fib'].get('low','—')}\n"
+        f"Nearest level: {t['nearest_fib']}\n\n"
+        f"*Pattern:* 🕯 {t['pattern']}\n\n"
+        f"*OVERALL: {t['signal']}* (tech score: {t['tech_score']})\n"
+        f"{'⚠️ '+t['warning'] if t['warning'] else ''}"
     )
+
+def format_sma_block(t: dict) -> str:
+    """Now returns full technical analysis block"""
+    return format_tech_block(t)
 
 # ── LIVE PRICE (OANDA + gold-api cross-check) ──────────────────────────────────
 async def get_live_price() -> str:
@@ -582,10 +812,10 @@ def is_trading_signal(text: str) -> bool:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bal = runtime_balance["value"]
     await update.message.reply_text(
-        f"⚖️ *ADEN GOLD AI BOT v4.0*\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Multi-TF + SMA + Pattern + 100pt Score\n"
+        f"⚖️ *ADEN GOLD AI BOT v4.1*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 SMA + RSI + MACD + Bollinger + Fib\n"
+        f"🕯 Candlestick pattern detection\n"
         f"💰 Live: OANDA + gold-api + Yahoo Finance\n"
-        f"📈 SMA 20/50/200 from OANDA candles\n"
         f"⏰ Singapore Time (SGT) ✅\n"
         f"💼 Balance: ${bal:,.2f}\n\n"
         f"*Commands:*\n"
@@ -606,32 +836,22 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_sma(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ *Fetching SMA data from OANDA...*", parse_mode="Markdown")
-    sma = await get_sma_analysis()
-    if not sma.get("available"):
-        await msg.edit_text("❌ SMA data unavailable. Check OANDA_TOKEN in Render.", parse_mode="Markdown")
+    msg = await update.message.reply_text(
+        "⏳ *Calculating RSI, MACD, Bollinger, SMA, Fibonacci...*",
+        parse_mode="Markdown"
+    )
+    t = await get_technical_analysis()
+    if not t.get("available"):
+        await msg.edit_text(
+            "❌ Technical data unavailable.\nCheck OANDA_TOKEN in Render.",
+            parse_mode="Markdown"
+        )
         return
-    ts = sgt_now()
-    chk = lambda x: "✅" if x else "❌"
-    trend = lambda t: "📈 Rising" if t == "rising" else "📉 Falling"
     await msg.edit_text(
-        f"📊 *SMA ANALYSIS — XAU/USD H1*\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Price: ${sma['price']}\n\n"
-        f"*Moving Averages:*\n"
-        f"SMA20:  ${sma['sma20']} | {trend(sma['sma20_trend'])}\n"
-        f"SMA50:  ${sma['sma50']} | {trend(sma['sma50_trend'])}\n"
-        f"SMA200: ${sma['sma200']}\n\n"
-        f"*Price Position:*\n"
-        f"Above SMA20:  {chk(sma['above_sma20'])}\n"
-        f"Above SMA50:  {chk(sma['above_sma50'])}\n"
-        f"Above SMA200: {chk(sma['above_sma200'])}\n\n"
-        f"*Crossover:*\n"
-        f"{'🟢 Fresh BUY crossover above SMA20!' if sma['crossed_above_sma20'] else ''}"
-        f"{'🔴 FALSE BREAKOUT — dropped below SMA20!' if sma['false_breakout'] else ''}"
-        f"{'No recent crossover' if not sma['crossed_above_sma20'] and not sma['false_breakout'] else ''}\n\n"
-        f"*Signal: {sma['signal']}*\n"
-        f"{'⚠️ '+sma['warning'] if sma['warning'] else ''}\n\n"
-        f"⏰ {ts}",
+        f"📊 *FULL TECHNICAL ANALYSIS — XAU/USD H1*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{format_tech_block(t)}\n"
+        f"⏰ {sgt_now()}",
         parse_mode="Markdown"
     )
 
