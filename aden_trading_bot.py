@@ -486,7 +486,7 @@ async def get_oil_price() -> str:
 # ── FETCH ALL LIVE DATA ────────────────────────────────────────────────────────
 async def get_all_live_data() -> dict:
     gold, dxy, oil, sma = await asyncio.gather(
-        get_live_price(), get_dxy_price(), get_oil_price(), get_sma_analysis(),
+        get_live_price(), get_dxy_price(), get_oil_price(), get_technical_analysis(),
         return_exceptions=True
     )
     return {
