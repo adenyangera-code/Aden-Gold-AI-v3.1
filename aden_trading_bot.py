@@ -4,6 +4,7 @@ import json
 import httpx
 import os
 import pytz
+import random
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -15,29 +16,172 @@ GEMINI_KEY     = os.environ.get("GEMINI_KEY",      "YOUR_GEMINI_API_KEY_HERE")
 OANDA_TOKEN    = os.environ.get("OANDA_TOKEN",     "")
 OANDA_ACCOUNT  = os.environ.get("OANDA_ACCOUNT",   "")
 SGT            = pytz.timezone("Asia/Singapore")
+CHAT_ID        = 192844206  # Aden Yang
 
-# ── RISK MANAGEMENT CONFIG ─────────────────────────────────────────────────────
-# Update ACCOUNT_BALANCE in Render environment variables when balance changes!
-ACCOUNT_BALANCE  = float(os.environ.get("ACCOUNT_BALANCE", "2000"))
-PIP_VALUE        = float(os.environ.get("PIP_VALUE",        "0.04"))
-MAX_RISK_PCT     = float(os.environ.get("MAX_RISK_PCT",     "1.0"))
-MAX_DAILY_LOSS   = float(os.environ.get("MAX_DAILY_LOSS",   "2.0"))
-SL_BUFFER_PIPS   = int(os.environ.get("SL_BUFFER_PIPS",    "5"))
-
-# Runtime balance (updated via /setbalance command)
+# ── RISK CONFIG ────────────────────────────────────────────────────────────────
+ACCOUNT_BALANCE = float(os.environ.get("ACCOUNT_BALANCE", "2000"))
+PIP_VALUE       = float(os.environ.get("PIP_VALUE",       "0.04"))
+MAX_RISK_PCT    = float(os.environ.get("MAX_RISK_PCT",    "1.0"))
+MAX_DAILY_LOSS  = float(os.environ.get("MAX_DAILY_LOSS",  "2.0"))
+SL_BUFFER_PIPS  = int(os.environ.get("SL_BUFFER_PIPS",   "5"))
 runtime_balance = {"value": ACCOUNT_BALANCE}
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── SGT TIMESTAMP ──────────────────────────────────────────────────────────────
+# ── MOTIVATION QUOTES ──────────────────────────────────────────────────────────
+QUOTES = [
+    ("The secret of getting ahead is getting started.", "Mark Twain"),
+    ("Success is not final, failure is not fatal: it is the courage to continue.", "Churchill"),
+    ("The market transfers money from the impatient to the patient.", "Warren Buffett"),
+    ("In investing, what is comfortable is rarely profitable.", "Robert Arnott"),
+    ("The goal of a successful trader is to make the best trades. Money is secondary.", "Alexander Elder"),
+    ("Small daily improvements over time lead to stunning results.", "Robin Sharma"),
+    ("Risk comes from not knowing what you are doing.", "Warren Buffett"),
+    ("Compound interest is the eighth wonder of the world.", "Albert Einstein"),
+    ("Cut your losses short and let your profits run.", "Trading Proverb"),
+    ("The trend is your friend until the end when it bends.", "Ed Seykota"),
+    ("Plan the trade and trade the plan.", "Trading Proverb"),
+    ("Discipline is the bridge between goals and accomplishment.", "Jim Rohn"),
+    ("Trade what you see, not what you think.", "Trading Proverb"),
+    ("Losses are tuition fees for the trading school.", "Unknown"),
+    ("Your first loss is your best loss.", "Trading Proverb"),
+    ("$1M is not a dream. It is a plan executed daily.", "Unknown"),
+    ("0.7% a day keeps poverty away.", "Aden Yang 2026"),
+    ("Patience is the most valuable trait of a good trader.", "Jesse Livermore"),
+    ("It is not the mountain we conquer but ourselves.", "Edmund Hillary"),
+    ("Structure your SL — never random, always logical.", "Aden Yang 2026"),
+]
+
+def get_quote() -> str:
+    q, a = random.choice(QUOTES)
+    return f'_"{q}"_\n— {a}'
+
+# ── TIME HELPERS ───────────────────────────────────────────────────────────────
 def sgt_now() -> str:
     return datetime.now(SGT).strftime("%d %b %H:%M SGT")
 
 def sgt_full() -> str:
     return datetime.now(SGT).strftime("%B %d, %Y %H:%M SGT")
 
-# ── LIVE GOLD PRICE (OANDA + gold-api cross-check) ────────────────────────────
+# ── OANDA CANDLES + SMA ────────────────────────────────────────────────────────
+async def get_oanda_candles(count: int = 200, granularity: str = "H1") -> list:
+    if not OANDA_TOKEN:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"https://api-fxtrade.oanda.com/v3/instruments/XAU_USD/candles"
+                f"?count={count}&granularity={granularity}&price=M",
+                headers={"Authorization": f"Bearer {OANDA_TOKEN}"}
+            )
+            data = resp.json()
+            closes = [float(c["mid"]["c"]) for c in data.get("candles", []) if c.get("complete", True)]
+            return closes
+    except Exception as e:
+        logger.warning(f"Candles failed: {e}")
+        return []
+
+def calc_sma(closes: list, period: int) -> float:
+    if len(closes) < period:
+        return 0.0
+    return sum(closes[-period:]) / period
+
+async def get_sma_analysis() -> dict:
+    closes = await get_oanda_candles(210, "H1")
+    if len(closes) < 50:
+        return {"available": False, "note": "Insufficient candle data"}
+
+    price = closes[-1]
+    sma20  = round(calc_sma(closes, 20), 3)
+    sma50  = round(calc_sma(closes, 50), 3)
+    sma200 = round(calc_sma(closes, 200), 3) if len(closes) >= 200 else 0
+
+    # Previous values for crossover detection
+    prev_price = closes[-2] if len(closes) >= 2 else price
+    prev_sma20 = round(calc_sma(closes[:-1], 20), 3) if len(closes) > 20 else sma20
+
+    # Price vs SMA
+    above_sma20  = price > sma20
+    above_sma50  = price > sma50
+    above_sma200 = price > sma200 if sma200 > 0 else None
+
+    # Crossover detection
+    crossed_above_sma20 = price > sma20 and prev_price <= prev_sma20
+    crossed_below_sma20 = price < sma20 and prev_price >= prev_sma20
+
+    # SMA trend (rising or falling)
+    sma20_trend  = "rising" if sma20 > calc_sma(closes[:-5], 20) else "falling"
+    sma50_trend  = "rising" if sma50 > calc_sma(closes[:-5], 50) else "falling"
+
+    # False breakout detection
+    false_breakout = crossed_below_sma20
+
+    # SMA Score (0-30)
+    score = 0
+    signal = "NEUTRAL"
+
+    if above_sma20 and above_sma50:
+        score += 15
+        signal = "BULLISH"
+    elif not above_sma20 and not above_sma50:
+        score -= 10
+        signal = "BEARISH"
+
+    if above_sma200:
+        score += 10
+        signal = "STRONG BULLISH"
+    elif above_sma200 == False:
+        score -= 5
+        signal = "BEARISH" if signal == "BEARISH" else signal
+
+    if crossed_above_sma20:
+        score += 5
+        signal = "BULLISH CROSSOVER"
+    elif false_breakout:
+        score -= 15
+        signal = "FALSE BREAKOUT"
+
+    # Warning
+    warning = ""
+    if false_breakout:
+        warning = "Price crossed above SMA20 then dropped below — FALSE BREAKOUT! Wait for confirmation."
+    elif crossed_above_sma20:
+        warning = "Fresh SMA20 crossover — monitor for confirmation."
+
+    return {
+        "available": True,
+        "price": round(price, 3),
+        "sma20": sma20,
+        "sma50": sma50,
+        "sma200": sma200,
+        "above_sma20": above_sma20,
+        "above_sma50": above_sma50,
+        "above_sma200": above_sma200,
+        "sma20_trend": sma20_trend,
+        "sma50_trend": sma50_trend,
+        "crossed_above_sma20": crossed_above_sma20,
+        "false_breakout": false_breakout,
+        "signal": signal,
+        "sma_score": score,
+        "warning": warning,
+    }
+
+def format_sma_block(s: dict) -> str:
+    if not s.get("available"):
+        return "_SMA data unavailable_"
+    chk = lambda x: "✅" if x else "❌"
+    trend = lambda t: "📈" if t == "rising" else "📉"
+    return (
+        f"📊 *SMA Analysis (H1):*\n"
+        f"SMA20:  ${s['sma20']} {trend(s['sma20_trend'])} | Price {'above' if s['above_sma20'] else 'BELOW'} {chk(s['above_sma20'])}\n"
+        f"SMA50:  ${s['sma50']} {trend(s['sma50_trend'])} | Price {'above' if s['above_sma50'] else 'BELOW'} {chk(s['above_sma50'])}\n"
+        f"SMA200: ${s['sma200']} | Price {'above' if s['above_sma200'] else 'BELOW'} {chk(s['above_sma200'])}\n"
+        f"Signal: *{s['signal']}*\n"
+        f"{'⚠️ '+s['warning'] if s['warning'] else ''}"
+    )
+
+# ── LIVE PRICE (OANDA + gold-api cross-check) ──────────────────────────────────
 async def get_live_price() -> str:
     oanda_price = None
     goldapi_price = None
@@ -46,14 +190,14 @@ async def get_live_price() -> str:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(
-                    "https://api-fxtrade.oanda.com/v3/instruments/XAU_USD/candles?count=1&granularity=S5&price=M",
+                    "https://api-fxtrade.oanda.com/v3/instruments/XAU_USD/candles"
+                    "?count=1&granularity=S5&price=M",
                     headers={"Authorization": f"Bearer {OANDA_TOKEN}"}
                 )
                 data = resp.json()
                 oanda_price = round(float(data["candles"][0]["mid"]["c"]), 3)
-                logger.info(f"OANDA: ${oanda_price}")
         except Exception as e:
-            logger.warning(f"OANDA failed: {e}")
+            logger.warning(f"OANDA price failed: {e}")
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -61,31 +205,27 @@ async def get_live_price() -> str:
                 "https://www.goldapi.io/api/XAU/USD",
                 headers={"x-access-token": "goldapi-free"}
             )
-            data = resp.json()
-            goldapi_price = round(float(data.get("price", 0)), 2)
-            logger.info(f"GoldAPI: ${goldapi_price}")
+            goldapi_price = round(float(resp.json().get("price", 0)), 2)
     except Exception as e:
         logger.warning(f"GoldAPI failed: {e}")
 
     if oanda_price and goldapi_price:
         diff_pct = (abs(oanda_price - goldapi_price) / oanda_price) * 100
-        if diff_pct < 0.1:
-            return f"{oanda_price} [OANDA Live] ✅ verified (vs gold-api: {diff_pct:.3f}%)"
-        else:
-            return f"{oanda_price} [OANDA Live] ⚠️ (gold-api shows ${goldapi_price})"
+        tag = "✅ verified" if diff_pct < 0.1 else "⚠️ mismatch"
+        return f"{oanda_price} [OANDA] {tag} (gold-api: ${goldapi_price})"
     if oanda_price:
         return f"{oanda_price} [OANDA only]"
     if goldapi_price:
         return f"{goldapi_price} [gold-api only]"
     return ""
 
-def parse_price(price_str: str) -> float:
+def parse_price(s: str) -> float:
     try:
-        return float(str(price_str).split()[0].replace(",",""))
+        return float(str(s).split()[0].replace(",",""))
     except Exception:
         return 0.0
 
-# ── LIVE DXY PRICE ─────────────────────────────────────────────────────────────
+# ── LIVE DXY ───────────────────────────────────────────────────────────────────
 async def get_dxy_price() -> str:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -93,14 +233,13 @@ async def get_dxy_price() -> str:
                 "https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1m&range=1d",
                 headers={"User-Agent": "Mozilla/5.0"}
             )
-            data = resp.json()
-            price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
+            price = resp.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
             return str(round(float(price), 2))
     except Exception as e:
         logger.warning(f"DXY failed: {e}")
         return ""
 
-# ── LIVE OIL PRICE ─────────────────────────────────────────────────────────────
+# ── LIVE OIL ───────────────────────────────────────────────────────────────────
 async def get_oil_price() -> str:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -108,8 +247,7 @@ async def get_oil_price() -> str:
                 "https://query1.finance.yahoo.com/v8/finance/chart/CL=F?interval=1m&range=1d",
                 headers={"User-Agent": "Mozilla/5.0"}
             )
-            data = resp.json()
-            price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
+            price = resp.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
             return str(round(float(price), 2))
     except Exception as e:
         logger.warning(f"Oil failed: {e}")
@@ -117,57 +255,52 @@ async def get_oil_price() -> str:
 
 # ── FETCH ALL LIVE DATA ────────────────────────────────────────────────────────
 async def get_all_live_data() -> dict:
-    gold, dxy, oil = await asyncio.gather(
-        get_live_price(), get_dxy_price(), get_oil_price(),
+    gold, dxy, oil, sma = await asyncio.gather(
+        get_live_price(), get_dxy_price(), get_oil_price(), get_sma_analysis(),
         return_exceptions=True
     )
     return {
         "gold": gold if isinstance(gold, str) else "",
         "dxy":  dxy  if isinstance(dxy,  str) else "",
         "oil":  oil  if isinstance(oil,  str) else "",
+        "sma":  sma  if isinstance(sma,  dict) else {"available": False},
     }
 
 # ── RISK CALCULATOR ────────────────────────────────────────────────────────────
-def calculate_risk(entry_price: float = 0, sl_price: float = 0) -> dict:
+def calculate_risk(entry: float = 0, sl: float = 0) -> dict:
     bal = runtime_balance["value"]
-    max_loss = bal * (MAX_RISK_PCT / 100)
-    daily_max = bal * (MAX_DAILY_LOSS / 100)
-    rec_sl_pips = round(max_loss / PIP_VALUE)
+    max_loss  = round(bal * MAX_RISK_PCT / 100, 2)
+    daily_max = round(bal * MAX_DAILY_LOSS / 100, 2)
+    rec_sl    = round(max_loss / PIP_VALUE)
 
-    if sl_price and entry_price:
-        sl_pips = round(abs(entry_price - sl_price) * 100)
+    if entry and sl:
+        sl_pips = round(abs(entry - sl) * 100)
         sl_cost = round(sl_pips * PIP_VALUE, 2)
         risk_pct = round((sl_cost / bal) * 100, 2)
-        acceptable = risk_pct <= MAX_RISK_PCT
+        ok = risk_pct <= MAX_RISK_PCT
     else:
-        sl_pips = rec_sl_pips
-        sl_cost = round(max_loss, 2)
+        sl_pips = rec_sl
+        sl_cost = max_loss
         risk_pct = MAX_RISK_PCT
-        acceptable = True
+        ok = True
 
     return {
-        "balance": bal,
-        "max_loss": round(max_loss, 2),
-        "daily_max": round(daily_max, 2),
-        "rec_sl_pips": rec_sl_pips,
-        "sl_pips": sl_pips,
-        "sl_cost": sl_cost,
-        "risk_pct": risk_pct,
-        "acceptable": acceptable
+        "balance": bal, "max_loss": max_loss, "daily_max": daily_max,
+        "rec_sl": rec_sl, "sl_pips": sl_pips, "sl_cost": sl_cost,
+        "risk_pct": risk_pct, "ok": ok
     }
 
 def format_risk_block(entry: str, sl: str) -> str:
     try:
-        e = parse_price(entry)
-        s = parse_price(sl)
+        e, s = parse_price(entry), parse_price(sl)
         if e <= 0 or s <= 0:
             return ""
         r = calculate_risk(e, s)
-        status = "✅ OK" if r["acceptable"] else "❌ TOO HIGH — reduce size!"
+        status = "✅ OK" if r["ok"] else "❌ TOO HIGH"
         return (
-            f"\n💰 *Risk Check:*\n"
-            f"SL: {r['sl_pips']} pips = ${r['sl_cost']} | {r['risk_pct']}% {status}\n"
-            f"Max allowed: ${r['max_loss']} ({MAX_RISK_PCT}%) | Daily: ${r['daily_max']}"
+            f"\n💰 *Risk:* {r['sl_pips']} pips = ${r['sl_cost']} "
+            f"| {r['risk_pct']}% {status}\n"
+            f"Max: ${r['max_loss']} | Daily: ${r['daily_max']}"
         )
     except Exception:
         return ""
@@ -176,73 +309,33 @@ def format_risk_block(entry: str, sl: str) -> str:
 async def get_market_news() -> dict:
     today = datetime.now(SGT)
     weekday = today.weekday()
-    weekly_events = {
-        0: ["📊 ISM Manufacturing (if scheduled) 10PM"],
-        1: ["📊 ISM Services PMI 10PM SGT", "🏦 RBA Rate Decision (varies)"],
-        2: ["📊 ADP Employment 8:15PM SGT", "🛢 EIA Oil Inventory 10:30PM SGT"],
-        3: ["📊 US Jobless Claims 8:30PM SGT", "🏦 ECB Rate (monthly)"],
-        4: ["💥 NFP Non-Farm Payrolls 8:30PM SGT BIGGEST!", "📊 Unemployment Rate 8:30PM SGT"],
+    scheduled = {
+        0: ["No major events Monday"],
+        1: ["ISM Services PMI 10PM SGT", "RBA Rate Decision (varies)"],
+        2: ["ADP Employment 8:15PM SGT", "EIA Oil Inventory 10:30PM SGT"],
+        3: ["US Jobless Claims 8:30PM SGT"],
+        4: ["NFP Non-Farm Payrolls 8:30PM SGT BIGGEST EVENT!"],
     }
-    todays_events = weekly_events.get(weekday, ["No major scheduled events today"])
-
-    news_prompt = f"""You are a financial news assistant. Today: {today.strftime('%A %B %d, %Y %H:%M SGT')}
-
-Search the web for:
-1. Major economic events or data releases TODAY affecting gold
-2. Latest Federal Reserve news
-3. Latest Iran-US conflict update (last 6 hours)
-4. Any surprise geopolitical or central bank news
-5. Upcoming events next 24 hours
-
+    prompt = f"""Financial news assistant. Today: {today.strftime('%A %B %d %Y %H:%M SGT')}
+Search for: major economic events today, Fed news, Iran-US update, upcoming events 24hrs.
 Return ONLY valid JSON:
-{{"breaking_news":["news 1","news 2"],"fed_update":"Fed news one line","iran_update":"Iran news one line","upcoming_events":["event 1 with SGT time","event 2"],"gold_impact":"bullish or bearish or neutral","impact_reason":"one sentence","risk_level":"HIGH or MEDIUM or LOW","safe_to_trade":true}}"""
-
+{{"breaking_news":["item1","item2"],"fed_update":"one line","iran_update":"one line","upcoming_events":["event 1","event 2"],"gold_impact":"bullish or bearish or neutral","impact_reason":"one sentence","risk_level":"HIGH or MEDIUM or LOW","safe_to_trade":true}}"""
     try:
-        data = await gemini_analysis(news_prompt)
-        if todays_events:
-            existing = data.get("upcoming_events", [])
-            data["upcoming_events"] = list(set(existing + todays_events))[:5]
+        data = await gemini_analysis(prompt)
+        data["upcoming_events"] = list(set(data.get("upcoming_events",[]) + scheduled.get(weekday,[])))[:5]
         return data
     except Exception as e:
         logger.warning(f"News failed: {e}")
-        return {
-            "breaking_news": ["Unable to fetch — check investing.com"],
-            "fed_update": "Check reuters.com for Fed news",
-            "iran_update": "Check reuters.com for Iran news",
-            "upcoming_events": todays_events,
-            "gold_impact": "neutral",
-            "impact_reason": "No live data available",
-            "risk_level": "MEDIUM",
-            "safe_to_trade": True
-        }
+        return {"breaking_news":["Check investing.com"],"fed_update":"—","iran_update":"—",
+                "upcoming_events":scheduled.get(weekday,[]),"gold_impact":"neutral",
+                "impact_reason":"No data","risk_level":"MEDIUM","safe_to_trade":True}
 
-def format_news(n: dict) -> str:
-    ts = sgt_now()
-    impact = {"bullish":"🟢 BULLISH","bearish":"🔴 BEARISH","neutral":"🟡 NEUTRAL"}.get(n.get("gold_impact","neutral"),"🟡 NEUTRAL")
-    risk = {"HIGH":"🔴 HIGH","MEDIUM":"🟡 MEDIUM","LOW":"🟢 LOW"}.get(n.get("risk_level","MEDIUM"),"🟡 MEDIUM")
-    safe = "✅ OK to trade" if n.get("safe_to_trade") else "❌ WAIT — news risk!"
-    breaking = "\n".join(f"• {b}" for b in n.get("breaking_news",[])[:4])
-    upcoming = "\n".join(f"• {e}" for e in n.get("upcoming_events",[])[:5])
-    return (
-        f"📰 *GOLD MARKET NEWS*\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{impact} | Risk: {risk}\n"
-        f"Trade now: {safe}\n\n"
-        f"🚨 *Breaking:*\n{breaking}\n\n"
-        f"🏦 Fed: _{n.get('fed_update','—')}_\n"
-        f"🌍 Iran: _{n.get('iran_update','—')}_\n\n"
-        f"📅 *Upcoming (SGT):*\n{upcoming}\n\n"
-        f"💡 _{n.get('impact_reason','—')}_\n"
-        f"⏰ {ts}\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ Always check news BEFORE trading!"
-    )
-
-# ── EXTRACT JSON ───────────────────────────────────────────────────────────────
+# ── JSON EXTRACTOR ─────────────────────────────────────────────────────────────
 def extract_json(text: str) -> dict:
     text = text.replace("```json","").replace("```","").strip()
-    start = text.find("{")
-    end = text.rfind("}") + 1
-    if start != -1 and end > start:
-        text = text[start:end]
+    s, e = text.find("{"), text.rfind("}") + 1
+    if s != -1 and e > s:
+        text = text[s:e]
     return json.loads(text)
 
 # ── GEMINI AI ──────────────────────────────────────────────────────────────────
@@ -257,15 +350,11 @@ async def gemini_analysis(prompt: str, retries: int = 2) -> dict:
                 })
                 data = resp.json()
                 if data.get("error",{}).get("code") in (503, 429):
-                    logger.warning(f"Gemini {data['error']['code']} attempt {attempt+1}")
                     if attempt < retries-1:
                         await asyncio.sleep(5)
                         continue
-                    raise ValueError(f"Gemini error: {data.get('error')}")
-                try:
-                    text = data["candidates"][0]["content"]["parts"][0]["text"]
-                except (KeyError, IndexError) as e:
-                    raise ValueError(f"Gemini parse error: {data.get('error', str(e))}")
+                    raise ValueError(f"Gemini error: {data['error']}")
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
                 return extract_json(text)
         except ValueError:
             raise
@@ -281,17 +370,10 @@ async def claude_analysis(prompt: str) -> dict:
     async with httpx.AsyncClient(timeout=90) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": ANTHROPIC_KEY,
-                "anthropic-version": "2023-06-01"
-            },
-            json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 1500,
-                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-                "messages": [{"role": "user", "content": prompt}]
-            }
+            headers={"Content-Type":"application/json","x-api-key":ANTHROPIC_KEY,"anthropic-version":"2023-06-01"},
+            json={"model":"claude-haiku-4-5-20251001","max_tokens":1500,
+                  "tools":[{"type":"web_search_20250305","name":"web_search"}],
+                  "messages":[{"role":"user","content":prompt}]}
         )
         data = resp.json()
         text = "".join(b["text"] for b in data.get("content",[]) if b.get("type")=="text")
@@ -301,101 +383,85 @@ async def claude_analysis(prompt: str) -> dict:
 
 # ── ANALYSIS PROMPT ────────────────────────────────────────────────────────────
 def build_analysis_prompt(live: dict) -> str:
-    today  = sgt_full()
-    gold_h = f"LIVE XAU/USD (OANDA): ${live['gold']}" if live["gold"] else "Search web for XAU/USD price (~$4,500-$5,000 in May 2026)"
-    dxy_h  = f"LIVE DXY: {live['dxy']}" if live["dxy"] else "Search web for DXY index level"
-    oil_h  = f"LIVE WTI OIL: ${live['oil']}" if live["oil"] else "Search web for WTI oil price"
+    today   = sgt_full()
+    gold_h  = f"LIVE XAU/USD (OANDA): ${live['gold']}" if live["gold"] else "Search for XAU/USD (~$4,500-$5,000 May 2026)"
+    dxy_h   = f"LIVE DXY: {live['dxy']}" if live["dxy"] else "Search for DXY level"
+    oil_h   = f"LIVE WTI OIL: ${live['oil']}" if live["oil"] else "Search for WTI oil"
+    sma     = live.get("sma", {})
+    sma_ctx = ""
+    if sma.get("available"):
+        sma_ctx = (
+            f"\nLIVE SMA DATA (from OANDA H1 candles):\n"
+            f"SMA20={sma['sma20']} SMA50={sma['sma50']} SMA200={sma['sma200']}\n"
+            f"Price {'ABOVE' if sma['above_sma20'] else 'BELOW'} SMA20 | "
+            f"Price {'ABOVE' if sma['above_sma50'] else 'BELOW'} SMA50 | "
+            f"Price {'ABOVE' if sma.get('above_sma200') else 'BELOW'} SMA200\n"
+            f"SMA20 trend: {sma['sma20_trend']} | SMA50 trend: {sma['sma50_trend']}\n"
+            f"Crossover: {'ABOVE SMA20' if sma['crossed_above_sma20'] else 'FALSE BREAKOUT' if sma['false_breakout'] else 'No recent crossover'}\n"
+            f"SMA Signal: {sma['signal']}"
+        )
+
     weekday = datetime.now(SGT).weekday()
     event_warn = {
-        2: "WARNING: ADP Employment 8:15PM SGT today — high volatility expected!",
-        3: "WARNING: Jobless Claims 8:30PM SGT today — volatility expected!",
-        4: "CRITICAL WARNING: NFP Non-Farm Payrolls 8:30PM SGT TODAY — DO NOT TRADE BEFORE RELEASE!"
+        2: "WARNING: ADP Employment 8:15PM SGT today!",
+        3: "WARNING: Jobless Claims 8:30PM SGT today!",
+        4: "CRITICAL: NFP 8:30PM SGT TODAY - DO NOT TRADE BEFORE!"
     }.get(weekday, "")
 
-    return f"""You are Aden Yang's professional gold trading AI. Singapore time: {today}
+    return f"""You are Aden Yang professional gold trading AI. {today}
 {event_warn}
 
-LIVE MARKET DATA (use these exact values, do NOT search for price):
+LIVE DATA (use exactly, do NOT search for price):
 {gold_h}
 {dxy_h}
 {oil_h}
-IMPORTANT: Gold is $4,500-$5,000 range in 2026. Ignore any 2024 price data.
+{sma_ctx}
 
-TASK: Search web ONLY for news and market sentiment. Use live data above for prices.
+Search web ONLY for: Iran-US news, Fed news, events next 2 hours.
 
-STEP 1 - SEARCH WEB for latest news only:
-Search for Iran-US conflict update, Fed news, any market-moving events next 2 hours.
+ANALYSIS STEPS:
+1. Multi-timeframe: Weekly/Daily/4H trends
+2. Technical: RSI, MACD, support/resistance, Fibonacci
+3. SMA analysis: use live SMA data above
+4. News risk: major event next 2hrs = WAIT
+5. Signal: BUY if 2+ TF bullish, SELL if 2+ bearish, WAIT if mixed
 
-STEP 2 - DETERMINE TRENDS from live price context:
-Weekly trend, Daily trend, 4H trend (bullish/bearish/neutral)
-
-STEP 3 - TECHNICAL ANALYSIS:
-RSI estimate, MACD direction, key support/resistance levels, Fibonacci levels
-
-STEP 4 - NEWS RISK CHECK:
-If major news in next 2 hours: set news_filter=true, signal=WAIT
-NFP/FOMC/CPI = always WAIT
-
-STEP 5 - GENERATE SIGNAL:
-BUY if 2+ timeframes bullish + no news risk
-SELL if 2+ timeframes bearish + no news risk
-WAIT if mixed OR news risk
-
-STEP 6 - SCORE out of 100 (be GENEROUS with scoring):
+SCORING (generous, minimum 25):
 Multi-TF (0-20): 10 if 1 TF clear, 20 if 2+ agree
-DXY (0-20): below 100 = 15-20pts, above 103 = 0-5pts
-RSI (0-15): 30-50 range = 10, below 35 = 15, neutral = 5
-SR Level (0-15): within $30 of level = 10, AT level = 15
-News (0-15): Iran war ongoing = min 8pts always, fresh catalyst = 15
-Pattern (0-10): any price action = 5, clear pattern = 10
-External (0-5): 3 baseline, 5 if confirming signals
-MINIMUM SCORE MUST BE 25. Never give 0 on news when Iran war is ongoing.
+DXY (0-20): below 100=15-20, above 103=0-5
+RSI (0-15): 30-50=10, below 35=15, neutral=5
+SR Level (0-15): within $30=10, at level=15
+News (0-15): Iran war ongoing=min 8, catalyst=15
+Pattern (0-10): any action=5, clear pattern=10
+SMA (0-5): above SMA20+50=5, crossover=3, false breakout=-5
 
-Return ONLY valid JSON no markdown:
-{{"price":"4721","signal":"BUY","entry":"4715","sl":"4700","tp1":"4740","tp2":"4760","rr":"1:2","session":"London","score_total":72,"score_multitf":15,"score_dxy":18,"score_rsi":10,"score_sr_level":10,"score_news":12,"score_pattern":5,"score_external":2,"weekly_trend":"bullish","daily_trend":"bullish","h4_trend":"neutral","rsi_value":"42","rsi_signal":"oversold","macd":"bullish","pattern_found":"higher lows","dxy":"98.15","dxy_trend":"falling","oil":"99.17","iran_update":"Iran peace talks progressing","key_support":"4700","key_resistance":"4760","fib_level":"4715 (38.2%)","reason":"DXY below 100 supports gold. Iran tensions provide safe haven demand.","risk_warning":"","news_filter":false,"trade_now":true}}"""
+Return ONLY valid JSON:
+{{"price":"4700","signal":"BUY","entry":"4695","sl":"4680","tp1":"4715","tp2":"4735","rr":"1:2","session":"London","score_total":75,"score_multitf":15,"score_dxy":18,"score_rsi":10,"score_sr_level":10,"score_news":12,"score_pattern":5,"score_external":2,"score_sma":3,"weekly_trend":"bullish","daily_trend":"bullish","h4_trend":"neutral","rsi_value":"42","rsi_signal":"oversold","macd":"bullish","pattern_found":"hammer","dxy":"98.15","dxy_trend":"falling","oil":"99","iran_update":"Peace talks ongoing","key_support":"4680","key_resistance":"4750","fib_level":"4695 (38.2%)","sma_signal":"bullish","sma_note":"Price above SMA20 and SMA50","reason":"DXY below 100 supports gold. RSI oversold at support. Price above key SMAs.","risk_warning":"","news_filter":false,"trade_now":true}}"""
 
 # ── CROSS-CHECK PROMPT ─────────────────────────────────────────────────────────
 def build_crosscheck_prompt(signal_text: str, live: dict) -> str:
     today  = sgt_full()
-    gold_h = f"LIVE XAU/USD (OANDA): ${live['gold']}" if live["gold"] else "Search for XAU/USD (~$4,500-$5,000 in 2026)"
-    dxy_h  = f"LIVE DXY: {live['dxy']}" if live["dxy"] else "Search for current DXY"
-    oil_h  = f"LIVE OIL: ${live['oil']}" if live["oil"] else "Search for current oil"
+    gold_h = f"LIVE XAU/USD: ${live['gold']}" if live["gold"] else "Search (~$4,500-$5,000)"
+    dxy_h  = f"LIVE DXY: {live['dxy']}" if live["dxy"] else "Search DXY"
+    oil_h  = f"LIVE OIL: ${live['oil']}" if live["oil"] else "Search oil"
+    sma    = live.get("sma", {})
+    sma_ctx = f"\nSMA: 20={sma.get('sma20',0)} 50={sma.get('sma50',0)} Signal={sma.get('signal','N/A')}" if sma.get("available") else ""
 
-    return f"""You are Aden Yang's professional gold trading AI. Singapore time: {today}
+    return f"""Professional gold AI. {today}
+{gold_h} | {dxy_h} | {oil_h}{sma_ctx}
 
-LIVE DATA:
-{gold_h}
-{dxy_h}
-{oil_h}
+FORWARDED SIGNAL: {signal_text}
 
-FORWARDED SIGNAL:
-{signal_text}
+1. Extract direction/entry/SL/TP/channel
+2. Search latest news only
+3. Multi-TF analysis + SMA check
+4. CONFIRMED>=70 MIXED=50-69 REJECTED<50
 
-TASKS:
-1. Extract: direction, entry, SL, TP, channel name from signal
-2. Search web for latest gold news only
-3. Run multi-timeframe analysis using live data
-4. Cross-reference and give verdict
-
-SCORING (generous, same as main analysis):
-Multi-TF (0-20): 10 if 1 TF clear, 20 if 2+ agree
-DXY (0-20): below 100 = 15-20, above 103 = 0-5
-RSI (0-15): 30-50 = 10, below 35 = 15, neutral = 5
-SR (0-15): within $30 = 10, AT level = 15
-News (0-15): Iran war = min 8 always, catalyst = 15
-Pattern (0-10): any action = 5, clear = 10
-MINIMUM SCORE: 25
-
-VERDICT RULES:
-CONFIRMED = score >= 70 AND AI agrees with direction
-MIXED = score 50-69 OR partially agrees
-REJECTED = score < 50 OR AI disagrees strongly
-
-Return ONLY valid JSON no markdown:
-{{"source_direction":"BUY","source_entry":"4700","source_sl":"4680","source_tp":"4730","source_name":"United Signals","current_price":"4705","ai_direction":"BUY","ai_agrees":true,"confidence":72,"score_total":72,"score_multitf":15,"score_dxy":18,"score_rsi":10,"score_sr_level":10,"score_news":12,"score_pattern":5,"score_external":2,"weekly_trend":"bullish","daily_trend":"bullish","h4_trend":"bullish","dxy":"98.15","dxy_trend":"falling","iran_update":"Peace talks progressing","rsi_value":"42","rsi_signal":"oversold","pattern_found":"higher lows","verdict":"CONFIRMED","recommended_entry":"4700","recommended_sl":"4683","recommended_tp1":"4725","recommended_tp2":"4750","recommended_rr":"1:2","reason":"DXY below 100 and bullish momentum confirm buy.","risk_warning":""}}"""
+Return ONLY valid JSON:
+{{"source_direction":"BUY","source_entry":"4700","source_sl":"4680","source_tp":"4730","source_name":"United Signals","current_price":"4705","ai_direction":"BUY","ai_agrees":true,"confidence":72,"score_total":72,"score_multitf":15,"score_dxy":18,"score_rsi":10,"score_sr_level":10,"score_news":12,"score_pattern":5,"score_sma":2,"weekly_trend":"bullish","daily_trend":"bullish","h4_trend":"bullish","dxy":"98.15","dxy_trend":"falling","iran_update":"Peace talks","rsi_value":"42","rsi_signal":"oversold","pattern_found":"none","sma_signal":"bullish","verdict":"CONFIRMED","recommended_entry":"4700","recommended_sl":"4683","recommended_tp1":"4725","recommended_tp2":"4750","recommended_rr":"1:2","reason":"All confirms align.","risk_warning":""}}"""
 
 # ── FORMAT SIGNAL ──────────────────────────────────────────────────────────────
-def format_signal(a: dict, source="AI") -> str:
+def format_signal(a: dict, source="AI", sma: dict = None) -> str:
     e  = {"BUY":"🟢","SELL":"🔴","WAIT":"🟡"}.get(a.get("signal","WAIT"),"⚪")
     d  = "📉" if a.get("dxy_trend")=="falling" else "📈" if a.get("dxy_trend")=="rising" else "➡️"
     ti = lambda t: "🟢" if t=="bullish" else "🔴" if t=="bearish" else "🟡"
@@ -403,31 +469,32 @@ def format_signal(a: dict, source="AI") -> str:
     sc = a.get("score_total", 0)
     sb = "█"*(sc//10) + "░"*(10-sc//10)
     ts = sgt_now()
+    sma_block = ("\n" + format_sma_block(sma)) if sma and sma.get("available") else ""
+    risk_block = format_risk_block(a.get("entry","0"), a.get("sl","0"))
 
     if a.get("signal") == "WAIT":
         return (
-            f"⚖️ *ADEN GOLD AI v3.2 — {source}*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚖️ *ADEN GOLD AI v4.0 — {source}*\n━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🟡 *WAIT* | 💰 ${a.get('price','—')}\n{sb} {sc}/100\n"
-            f"{si} {a.get('session','—')}\n\n"
+            f"{si} {a.get('session','—')}\n"
+            f"{sma_block}\n\n"
             f"📊 *TF:* W:{ti(a.get('weekly_trend','neutral'))} {a.get('weekly_trend','—').upper()} | "
             f"D:{ti(a.get('daily_trend','neutral'))} {a.get('daily_trend','—').upper()} | "
             f"4H:{ti(a.get('h4_trend','neutral'))} {a.get('h4_trend','—').upper()}\n\n"
             f"📈 *Score {sc}/100:*\n"
-            f"MTF:{a.get('score_multitf',0)}/20 DXY:{a.get('score_dxy',0)}/20 RSI:{a.get('score_rsi',0)}/15\n"
-            f"S/R:{a.get('score_sr_level',0)}/15 News:{a.get('score_news',0)}/15 Pat:{a.get('score_pattern',0)}/10\n\n"
+            f"MTF:{a.get('score_multitf',0)} DXY:{a.get('score_dxy',0)} RSI:{a.get('score_rsi',0)} "
+            f"S/R:{a.get('score_sr_level',0)} News:{a.get('score_news',0)} Pat:{a.get('score_pattern',0)} SMA:{a.get('score_sma',0)}\n\n"
             f"{d} DXY:{a.get('dxy','—')} ({a.get('dxy_trend','—')}) | 🛢${a.get('oil','—')}\n"
             f"📍 S:${a.get('key_support','—')} R:${a.get('key_resistance','—')}\n"
-            f"🌍 _{a.get('iran_update','—')}_\n"
-            f"💡 _{a.get('reason','—')}_\n"
-            f"{'⚠️ '+a.get('risk_warning') if a.get('risk_warning') else ''}\n"
-            f"⏰ {ts}"
+            f"🌍 _{a.get('iran_update','—')}_\n💡 _{a.get('reason','—')}_\n"
+            f"{'⚠️ '+a.get('risk_warning') if a.get('risk_warning') else ''}\n⏰ {ts}"
         )
 
-    risk_block = format_risk_block(a.get('entry','0'), a.get('sl','0'))
     return (
-        f"⚖️ *ADEN GOLD AI v3.2 — {source}*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚖️ *ADEN GOLD AI v4.0 — {source}*\n━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{e} *{a.get('signal','—')}* | 💰 ${a.get('price','—')}\n{sb} {sc}/100\n"
-        f"{si} {a.get('session','—')}\n\n"
+        f"{si} {a.get('session','—')}\n"
+        f"{sma_block}\n\n"
         f"🎯 *SAR:*\n"
         f"┌ 📍 Entry: `${a.get('entry','—')}`\n"
         f"│ 🛑 SL:    `${a.get('sl','—')}`\n"
@@ -439,13 +506,12 @@ def format_signal(a: dict, source="AI") -> str:
         f"D:{ti(a.get('daily_trend','neutral'))} {a.get('daily_trend','—').upper()} | "
         f"4H:{ti(a.get('h4_trend','neutral'))} {a.get('h4_trend','—').upper()}\n\n"
         f"📈 *Score {sc}/100:*\n"
-        f"MTF:{a.get('score_multitf',0)}/20 DXY:{a.get('score_dxy',0)}/20 RSI:{a.get('score_rsi',0)}/15\n"
-        f"S/R:{a.get('score_sr_level',0)}/15 News:{a.get('score_news',0)}/15 Pat:{a.get('score_pattern',0)}/10\n"
+        f"MTF:{a.get('score_multitf',0)} DXY:{a.get('score_dxy',0)} RSI:{a.get('score_rsi',0)} "
+        f"S/R:{a.get('score_sr_level',0)} News:{a.get('score_news',0)} Pat:{a.get('score_pattern',0)} SMA:{a.get('score_sma',0)}\n"
         f"🕯 {a.get('pattern_found','none')} | 📐 {a.get('fib_level','none')}\n\n"
         f"{d} DXY:{a.get('dxy','—')} ({a.get('dxy_trend','—')}) | 🛢${a.get('oil','—')}\n"
         f"📍 S:${a.get('key_support','—')} R:${a.get('key_resistance','—')}\n"
-        f"🌍 _{a.get('iran_update','—')}_\n"
-        f"💡 _{a.get('reason','—')}_\n"
+        f"🌍 _{a.get('iran_update','—')}_\n💡 _{a.get('reason','—')}_\n"
         f"{'⚠️ '+a.get('risk_warning') if a.get('risk_warning') else ''}\n"
         f"⏰ {ts}\n━━━━━━━━━━━━━━━━━━━━━━\n"
         f"✅ SL before entry | Max 2u | 0.7-1% target"
@@ -464,21 +530,15 @@ def format_crosscheck(a: dict) -> str:
     risk_block = format_risk_block(a.get("recommended_entry","0"), a.get("recommended_sl","0"))
 
     return (
-        f"⚖️ *SIGNAL CROSS-CHECK v3.2*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚖️ *SIGNAL CROSS-CHECK v4.0*\n━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{ve} *{a.get('verdict','—')}* | {sb} {a.get('confidence',0)}%\n\n"
         f"📨 *Source ({a.get('source_name','Unknown')}):*\n"
-        f"{se} {a.get('source_direction','—')} | "
-        f"Entry:${a.get('source_entry','—')} SL:${a.get('source_sl','—')} TP:${a.get('source_tp','—')}\n\n"
-        f"🤖 *AI Check:*\n"
-        f"{ae} {a.get('ai_direction','—')} | Agrees:{'✅' if a.get('ai_agrees') else '❌'} | "
-        f"Now:${a.get('current_price','—')}\n\n"
-        f"📊 *TF:* W:{ti(a.get('weekly_trend','neutral'))} {a.get('weekly_trend','—').upper()} | "
-        f"D:{ti(a.get('daily_trend','neutral'))} {a.get('daily_trend','—').upper()} | "
-        f"4H:{ti(a.get('h4_trend','neutral'))} {a.get('h4_trend','—').upper()}\n\n"
-        f"📈 *Score {sc}/100:*\n"
-        f"MTF:{a.get('score_multitf',0)}/20 DXY:{a.get('score_dxy',0)}/20 RSI:{a.get('score_rsi',0)}/15\n"
-        f"S/R:{a.get('score_sr_level',0)}/15 News:{a.get('score_news',0)}/15 Pat:{a.get('score_pattern',0)}/10\n"
-        f"🕯 {a.get('pattern_found','none')}\n\n"
+        f"{se} {a.get('source_direction','—')} | Entry:${a.get('source_entry','—')} SL:${a.get('source_sl','—')} TP:${a.get('source_tp','—')}\n\n"
+        f"🤖 *AI Check:* {ae} {a.get('ai_direction','—')} | Agrees:{'✅' if a.get('ai_agrees') else '❌'} | Now:${a.get('current_price','—')}\n\n"
+        f"📊 *TF:* W:{ti(a.get('weekly_trend','neutral'))} | D:{ti(a.get('daily_trend','neutral'))} | 4H:{ti(a.get('h4_trend','neutral'))}\n"
+        f"📈 *Score {sc}/100:* MTF:{a.get('score_multitf',0)} DXY:{a.get('score_dxy',0)} RSI:{a.get('score_rsi',0)} "
+        f"S/R:{a.get('score_sr_level',0)} News:{a.get('score_news',0)} SMA:{a.get('score_sma',0)}\n"
+        f"SMA: {a.get('sma_signal','—')}\n\n"
         f"{d} DXY:{a.get('dxy','—')} | 🌍 _{a.get('iran_update','—')}_\n\n"
         f"🎯 *Recommended SAR:*\n"
         f"┌ 📍 Entry: `${a.get('recommended_entry','—')}`\n"
@@ -493,123 +553,92 @@ def format_crosscheck(a: dict) -> str:
         f"✅ SL before entry | Max 2u | 0.7-1% target"
     )
 
-# ── DETECT TRADING SIGNAL ──────────────────────────────────────────────────────
+def format_news(n: dict) -> str:
+    ts = sgt_now()
+    impact = {"bullish":"🟢 BULLISH","bearish":"🔴 BEARISH","neutral":"🟡 NEUTRAL"}.get(n.get("gold_impact","neutral"),"🟡")
+    risk   = {"HIGH":"🔴 HIGH","MEDIUM":"🟡 MEDIUM","LOW":"🟢 LOW"}.get(n.get("risk_level","MEDIUM"),"🟡")
+    safe   = "✅ OK to trade" if n.get("safe_to_trade") else "❌ WAIT — news risk!"
+    breaking = "\n".join(f"• {b}" for b in n.get("breaking_news",[])[:4])
+    upcoming = "\n".join(f"• {e}" for e in n.get("upcoming_events",[])[:5])
+    return (
+        f"📰 *GOLD MARKET NEWS*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{impact} | Risk: {risk} | {safe}\n\n"
+        f"🚨 *Breaking:*\n{breaking}\n\n"
+        f"🏦 Fed: _{n.get('fed_update','—')}_\n"
+        f"🌍 Iran: _{n.get('iran_update','—')}_\n\n"
+        f"📅 *Upcoming (SGT):*\n{upcoming}\n\n"
+        f"💡 _{n.get('impact_reason','—')}_\n"
+        f"⏰ {ts}"
+    )
+
+# ── SIGNAL DETECTOR ────────────────────────────────────────────────────────────
 def is_trading_signal(text: str) -> bool:
-    keywords = [
-        "buy","sell","entry","sl:","tp:","stop loss","take profit",
-        "xau","gold","signal","long","short","target","pips",
-        "limit","breakout","support","resistance","bullish","bearish"
-    ]
+    keywords = ["buy","sell","entry","sl:","tp:","stop loss","take profit",
+                "xau","gold","signal","long","short","target","pips",
+                "limit","breakout","support","resistance","bullish","bearish"]
     return sum(1 for k in keywords if k in text.lower()) >= 1
 
-# ── COMMANDS ──────────────────────────────────────────────────────────────────
+# ── COMMANDS ───────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bal = runtime_balance["value"]
     await update.message.reply_text(
-        "⚖️ *ADEN GOLD AI BOT v3.2*\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📊 Multi-TF + Pattern + 100pt Scoring\n"
-        "💰 Live: OANDA + gold-api + Yahoo Finance\n"
-        "⏰ Singapore Time (SGT) ✅\n"
-        "🔄 Auto cross-reference signals\n"
-        f"💼 Balance: ${bal} | Pip: ${PIP_VALUE}\n\n"
-        "*Commands:*\n"
-        "/signal — Full Claude analysis\n"
-        "/quick — Fast Gemini (free)\n"
-        "/news — Latest news + events\n"
-        "/risk — Risk calculator\n"
-        "/setbalance — Update your balance\n"
-        "/crossref — How to forward signals\n"
-        "/rules — Trading rules\n"
-        "/status — Bot status\n\n"
-        "*Forward signals from:*\n"
-        "📊 United Signals\n📊 SureShotFX\n"
-        "📊 FXPremiere\n📊 Uncle Lim Journey\n\n"
-        "_Forward or paste = instant cross-check!_ 💪",
+        f"⚖️ *ADEN GOLD AI BOT v4.0*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Multi-TF + SMA + Pattern + 100pt Score\n"
+        f"💰 Live: OANDA + gold-api + Yahoo Finance\n"
+        f"📈 SMA 20/50/200 from OANDA candles\n"
+        f"⏰ Singapore Time (SGT) ✅\n"
+        f"💼 Balance: ${bal:,.2f}\n\n"
+        f"*Commands:*\n"
+        f"/monday — 🌅 Monday morning brief\n"
+        f"/signal — Full Claude analysis + SMA\n"
+        f"/quick — Fast Gemini (free) + SMA\n"
+        f"/sma — SMA analysis only\n"
+        f"/news — Latest news + events\n"
+        f"/risk — Risk calculator\n"
+        f"/setbalance — Update balance\n"
+        f"/crossref — Forward signal guide\n"
+        f"/rules — Trading rules\n"
+        f"/status — Bot status\n\n"
+        f"*Signal Channels (forward to bot):*\n"
+        f"📊 United Signals | SureShotFX\n"
+        f"📊 FXPremiere | Uncle Lim Journey",
         parse_mode="Markdown"
     )
 
-async def cmd_setbalance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        args = ctx.args
-        if not args:
-            bal = runtime_balance["value"]
-            r = calculate_risk()
-            await update.message.reply_text(
-                f"💼 *Current Balance: ${bal}*\n\n"
-                f"To update type:\n`/setbalance 2000`\n\n"
-                f"Max risk/trade: ${r['max_loss']} ({MAX_RISK_PCT}%)\n"
-                f"Daily limit: ${r['daily_max']} ({MAX_DAILY_LOSS}%)",
-                parse_mode="Markdown"
-            )
-            return
-
-        new_bal = float(args[0].replace(",","").replace("$",""))
-        old_bal = runtime_balance["value"]
-        runtime_balance["value"] = new_bal
-        r = calculate_risk()
-
-        await update.message.reply_text(
-            f"✅ *Balance Updated!*\n━━━━━━━━━━━━━━\n"
-            f"Old: ${old_bal}\n"
-            f"New: *${new_bal}*\n\n"
-            f"📊 *New Risk Limits:*\n"
-            f"Max/trade: *${r['max_loss']}* ({MAX_RISK_PCT}%)\n"
-            f"Daily max: *${r['daily_max']}* ({MAX_DAILY_LOSS}%)\n"
-            f"Rec SL: *{r['rec_sl_pips']} pips*\n\n"
-            f"_Type /risk for full breakdown_",
-            parse_mode="Markdown"
-        )
-    except (IndexError, ValueError):
-        await update.message.reply_text(
-            "❌ Invalid format.\nUse: `/setbalance 2000`",
-            parse_mode="Markdown"
-        )
-
-async def cmd_risk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    r = calculate_risk()
+async def cmd_sma(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("⏳ *Fetching SMA data from OANDA...*", parse_mode="Markdown")
+    sma = await get_sma_analysis()
+    if not sma.get("available"):
+        await msg.edit_text("❌ SMA data unavailable. Check OANDA_TOKEN in Render.", parse_mode="Markdown")
+        return
     ts = sgt_now()
-    hour = datetime.now(SGT).hour
-    if 15 <= hour < 20:
-        session, rec_sl = "London 🇬🇧", "25-35 pips"
-    elif 20 <= hour < 24:
-        session, rec_sl = "New York 🇺🇸", "20-30 pips"
-    else:
-        session, rec_sl = "Asian 🌏", "15-25 pips"
-
-    await update.message.reply_text(
-        f"💰 *RISK MANAGEMENT CALCULATOR*\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💼 Balance: *${r['balance']}*\n"
-        f"📊 Pip Value: ${PIP_VALUE}/pip\n"
-        f"⚠️ Max Risk: {MAX_RISK_PCT}% per trade\n"
-        f"🛑 Daily Limit: {MAX_DAILY_LOSS}%\n\n"
-        f"🎯 *Current Limits:*\n"
-        f"Max loss/trade: *${r['max_loss']}*\n"
-        f"Max daily loss: *${r['daily_max']}*\n"
-        f"Recommended SL: *{r['rec_sl_pips']} pips*\n\n"
-        f"⏰ Session: {session}\n"
-        f"📐 Ideal SL now: {rec_sl}\n"
-        f"🔵 Buffer: {SL_BUFFER_PIPS} pips beyond S/R\n\n"
-        f"*SL Cost Guide:*\n"
-        f"15 pips = ${round(15*PIP_VALUE,2)}\n"
-        f"25 pips = ${round(25*PIP_VALUE,2)}\n"
-        f"50 pips = ${round(50*PIP_VALUE,2)}\n"
-        f"75 pips = ${round(75*PIP_VALUE,2)}\n"
-        f"100 pips = ${round(100*PIP_VALUE,2)}\n\n"
-        f"💡 _Place SL {SL_BUFFER_PIPS} pips BEYOND_\n"
-        f"_nearest support/resistance!_\n"
-        f"_Update balance: /setbalance 2000_\n"
+    chk = lambda x: "✅" if x else "❌"
+    trend = lambda t: "📈 Rising" if t == "rising" else "📉 Falling"
+    await msg.edit_text(
+        f"📊 *SMA ANALYSIS — XAU/USD H1*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Price: ${sma['price']}\n\n"
+        f"*Moving Averages:*\n"
+        f"SMA20:  ${sma['sma20']} | {trend(sma['sma20_trend'])}\n"
+        f"SMA50:  ${sma['sma50']} | {trend(sma['sma50_trend'])}\n"
+        f"SMA200: ${sma['sma200']}\n\n"
+        f"*Price Position:*\n"
+        f"Above SMA20:  {chk(sma['above_sma20'])}\n"
+        f"Above SMA50:  {chk(sma['above_sma50'])}\n"
+        f"Above SMA200: {chk(sma['above_sma200'])}\n\n"
+        f"*Crossover:*\n"
+        f"{'🟢 Fresh BUY crossover above SMA20!' if sma['crossed_above_sma20'] else ''}"
+        f"{'🔴 FALSE BREAKOUT — dropped below SMA20!' if sma['false_breakout'] else ''}"
+        f"{'No recent crossover' if not sma['crossed_above_sma20'] and not sma['false_breakout'] else ''}\n\n"
+        f"*Signal: {sma['signal']}*\n"
+        f"{'⚠️ '+sma['warning'] if sma['warning'] else ''}\n\n"
         f"⏰ {ts}",
         parse_mode="Markdown"
     )
 
 async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text(
-        "⏳ *Fetching live data + Claude analysis...*",
-        parse_mode="Markdown"
-    )
+    msg = await update.message.reply_text("⏳ *Fetching live data + SMA + Claude analysis...*", parse_mode="Markdown")
     try:
         live = await get_all_live_data()
-        logger.info(f"Live: gold={live['gold']} dxy={live['dxy']} oil={live['oil']}")
         prompt = build_analysis_prompt(live)
         source = "CLAUDE"
         try:
@@ -622,52 +651,84 @@ async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             raw = parse_price(live["gold"])
             if raw > 0 and abs(parse_price(a.get("price","0")) - raw) > 200:
                 a["price"] = str(raw)
-        await msg.edit_text(format_signal(a, source), parse_mode="Markdown")
+        await msg.edit_text(format_signal(a, source, live.get("sma")), parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"Signal error: {e}")
-        await msg.edit_text(f"❌ Analysis failed.\n`{str(e)[:150]}`", parse_mode="Markdown")
+        await msg.edit_text(f"❌ Failed: {str(e)[:150]}", parse_mode="Markdown")
 
 async def cmd_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text(
-        "⏳ *Fetching live data + Gemini analysis...*",
-        parse_mode="Markdown"
-    )
+    msg = await update.message.reply_text("⏳ *Fetching live data + SMA + Gemini analysis...*", parse_mode="Markdown")
     try:
         live = await get_all_live_data()
-        logger.info(f"Live: gold={live['gold']} dxy={live['dxy']} oil={live['oil']}")
-        prompt = build_analysis_prompt(live)
-        a = await gemini_analysis(prompt)
+        a = await gemini_analysis(build_analysis_prompt(live))
         if live["gold"]:
             raw = parse_price(live["gold"])
             if raw > 0 and abs(parse_price(a.get("price","0")) - raw) > 200:
                 a["price"] = str(raw)
-        await msg.edit_text(format_signal(a, "GEMINI"), parse_mode="Markdown")
+        await msg.edit_text(format_signal(a, "GEMINI", live.get("sma")), parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"Quick error: {e}")
         await msg.edit_text(f"❌ Gemini failed: {str(e)[:150]}\nTry /signal instead.", parse_mode="Markdown")
 
 async def cmd_news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ *Fetching latest news...*", parse_mode="Markdown")
     try:
-        news = await get_market_news()
-        await msg.edit_text(format_news(news), parse_mode="Markdown")
+        await msg.edit_text(format_news(await get_market_news()), parse_mode="Markdown")
     except Exception as e:
         await msg.edit_text(f"❌ News failed: {str(e)[:100]}", parse_mode="Markdown")
 
+async def cmd_risk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    r = calculate_risk()
+    ts = sgt_now()
+    hour = datetime.now(SGT).hour
+    if 15 <= hour < 20:
+        session, rec = "London 🇬🇧", "25-35 pips"
+    elif 20 <= hour < 24:
+        session, rec = "New York 🇺🇸", "20-30 pips"
+    else:
+        session, rec = "Asian 🌏", "15-25 pips"
+    await update.message.reply_text(
+        f"💰 *RISK CALCULATOR*\n━━━━━━━━━━━━━━\n"
+        f"💼 Balance: *${r['balance']:,.2f}*\n"
+        f"📊 Pip: ${PIP_VALUE} | Max: {MAX_RISK_PCT}%\n\n"
+        f"Max/trade: *${r['max_loss']}*\n"
+        f"Daily limit: *${r['daily_max']}*\n"
+        f"Rec SL: *{r['rec_sl']} pips*\n\n"
+        f"Session: {session} | Ideal SL: {rec}\n"
+        f"Buffer: {SL_BUFFER_PIPS} pips beyond S/R\n\n"
+        f"15p=${round(15*PIP_VALUE,2)} | 25p=${round(25*PIP_VALUE,2)} | "
+        f"50p=${round(50*PIP_VALUE,2)} | 100p=${round(100*PIP_VALUE,2)}\n\n"
+        f"_/setbalance [amount] to update_\n⏰ {ts}",
+        parse_mode="Markdown"
+    )
+
+async def cmd_setbalance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        args = ctx.args
+        if not args:
+            await update.message.reply_text(
+                f"💼 Current: ${runtime_balance['value']:,.2f}\nUse: `/setbalance 2000`",
+                parse_mode="Markdown"
+            )
+            return
+        new_bal = float(args[0].replace(",","").replace("$",""))
+        old = runtime_balance["value"]
+        runtime_balance["value"] = new_bal
+        r = calculate_risk()
+        await update.message.reply_text(
+            f"✅ *Balance Updated!*\n${old:,.2f} → *${new_bal:,.2f}*\n\n"
+            f"Max/trade: ${r['max_loss']} | Daily: ${r['daily_max']}\n"
+            f"TP1: ${round(new_bal*0.003,2)} | TP2: ${round(new_bal*0.005,2)}",
+            parse_mode="Markdown"
+        )
+    except (IndexError, ValueError):
+        await update.message.reply_text("❌ Use: `/setbalance 2000`", parse_mode="Markdown")
+
 async def cmd_crossref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📨 *Cross-Reference Guide:*\n\n"
-        "*Forward method:*\n"
-        "1. Open signal channel\n"
-        "2. Long press signal message\n"
-        "3. Tap Forward\n"
-        "4. Select @AdenGoldAI_bot ✅\n\n"
-        "*Paste method:*\n"
-        "Paste signal text directly here!\n\n"
-        "*Results:*\n"
-        "✅ CONFIRMED = Trade it!\n"
-        "⚠️ MIXED = Be careful!\n"
-        "❌ REJECTED = Skip it!",
+        "📨 *Cross-Reference:*\n\n"
+        "1. Open signal channel\n2. Long press message\n"
+        "3. Tap Forward\n4. Select @AdenGoldAI_bot ✅\n\n"
+        "Or paste signal text here!\n\n"
+        "✅ CONFIRMED = Trade | ⚠️ MIXED = Careful | ❌ REJECTED = Skip",
         parse_mode="Markdown"
     )
 
@@ -675,53 +736,125 @@ async def cmd_rules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bal = runtime_balance["value"]
     r = calculate_risk()
     await update.message.reply_text(
-        "📋 *ADEN'S TRADING RULES v3.2*\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        "★ SL BEFORE entry — always!\n"
-        "★ Max 2u position size\n"
+        f"📋 *ADEN'S RULES v4.0*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"★ SL BEFORE entry always!\n"
+        f"★ Structure SL + {SL_BUFFER_PIPS} pip buffer\n"
+        f"★ AI bot + own chart = both confirm\n"
+        f"★ Check SMA crossover — no false breakout!\n"
         f"★ Max loss/trade: ${r['max_loss']} ({MAX_RISK_PCT}%)\n"
-        f"★ Max daily loss: ${r['daily_max']} ({MAX_DAILY_LOSS}%)\n"
-        f"★ Recommended SL: {r['rec_sl_pips']} pips\n"
-        "★ TP = 10-15 pips only\n"
-        "★ Daily target = 0.7-1%\n"
-        "★ 2 losses = STOP today\n"
-        "★ Target hit = LOG OFF!\n"
-        "★ Gold only — no USD/JPY!\n"
-        "★ Score >= 70 to trade!\n"
-        "★ No trading before NFP/FOMC!\n"
-        "★ London/NY sessions only!\n\n"
-        "*SAR:* SET → ADJUST → RUN\n\n"
-        f"_Balance: ${bal} | Update: /setbalance_\n"
-        "_Small profits beat big losses!_ 💪",
+        f"★ TP1 at 0.3% = ${round(bal*0.003,2)}\n"
+        f"★ TP2 at 0.5% = ${round(bal*0.005,2)}\n"
+        f"★ Daily target 0.7-1% = ${round(bal*0.007,2)}-${round(bal*0.01,2)}\n"
+        f"★ 2 losses = STOP today!\n"
+        f"★ Target hit = LOG OFF!\n"
+        f"★ Gold only — no USD/JPY!\n"
+        f"★ Score >= 70 to trade!\n"
+        f"★ London+NY sessions only!\n\n"
+        f"*SAR:* SET → ADJUST → RUN\n"
+        f"_Small profits compound to millions!_ 💪",
         parse_mode="Markdown"
     )
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ts = sgt_now()
-    bal = runtime_balance["value"]
     await update.message.reply_text(
-        f"🤖 *BOT STATUS v3.2*\n━━━━━━━━━━━━━━\n"
-        f"✅ Online | ⏰ {ts}\n"
-        f"💼 Balance: ${bal}\n"
-        f"📊 On-demand mode\n"
-        f"💰 Live: OANDA + gold-api + Yahoo Finance\n"
-        f"🤖 Claude Haiku + Gemini 2.5 Flash\n"
-        f"🔄 Cross-check: Active\n\n"
-        f"*Signal Channels:*\n"
-        f"📊 United Signals\n"
-        f"📊 SureShotFX\n"
-        f"📊 FXPremiere\n"
-        f"📊 Uncle Lim Journey",
+        f"🤖 *BOT STATUS v4.0*\n━━━━━━━━━━━━━━\n"
+        f"✅ Online | ⏰ {sgt_now()}\n"
+        f"💼 Balance: ${runtime_balance['value']:,.2f}\n"
+        f"📈 SMA: OANDA H1 candles\n"
+        f"💰 Live: OANDA + gold-api + Yahoo\n"
+        f"🤖 Claude Haiku + Gemini 2.5 Flash\n\n"
+        f"*Channels:* United Signals | SureShotFX\n"
+        f"FXPremiere | Uncle Lim Journey",
         parse_mode="Markdown"
     )
 
-# ── HANDLE FORWARDED / PASTED SIGNALS ─────────────────────────────────────────
+async def cmd_monday(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _send_monday_brief(ctx.bot if hasattr(ctx, 'bot') else None, update=update)
+
+async def _send_monday_brief(bot=None, update=None):
+    bal = runtime_balance["value"]
+    r   = calculate_risk()
+    ts  = sgt_now()
+    milestones = [("W8 $4,695",4695),("W15 $10K",10000),("W33 $30K",30000),("W60 $100K",100000),("$1M",1000000)]
+    tracker = "\n".join(f"{'✅' if bal>=m else '⏳'} {l}" for l,m in milestones)
+    text = (
+        f"🌅 *MONDAY MORNING BRIEF*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏰ {ts}\n\n💪 {get_quote()}\n\n"
+        f"💼 *ACCOUNT:* ${bal:,.2f}\n"
+        f"🎯 Daily: ${round(bal*0.007,2)} (0.7%) → ${round(bal*0.01,2)} (1%)\n"
+        f"📍 TP1: ${round(bal*0.003,2)} | TP2: ${round(bal*0.005,2)}\n"
+        f"🛑 Max risk: ${r['max_loss']} per trade\n\n"
+        f"📊 *$1M TRACKER:*\n{tracker}\n\n"
+        f"📋 *WEEKLY CHECK-IN:*\n"
+        f"1. Last week balance?\n2. Win/loss count?\n"
+        f"3. Best + worst trade?\n4. Lessons learned?\n\n"
+        f"💰 *DEPOSIT $500 TODAY!* ✅\n\n"
+        f"✅ Structure SL + 5 pip buffer\n"
+        f"✅ AI + own chart + SMA confirm\n"
+        f"✅ Take 0.3% then 0.5% — no greed!\n"
+        f"✅ 2 losses = STOP | Target = LOG OFF!\n\n"
+        f"🚨 *RED FLAGS:*\n"
+        f"❌ Loss > ${r['daily_max']} in a day\n"
+        f"❌ Trading outside London/NY\n"
+        f"❌ No SL set | Chasing losses\n\n"
+        f"🌟 _Small consistent wins_\n_compound into millions. $1M by 2028_ 💪\n\n"
+        f"Type /news | /sma | /quick to start!"
+    )
+    if bot:
+        await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="Markdown")
+    elif update:
+        await update.message.reply_text(text, parse_mode="Markdown")
+
+# ── SCHEDULED JOBS ─────────────────────────────────────────────────────────────
+async def job_morning_quote(ctx: ContextTypes.DEFAULT_TYPE):
+    if datetime.now(SGT).weekday() >= 5: return
+    await ctx.bot.send_message(chat_id=CHAT_ID,
+        text=f"☀️ *GOOD MORNING ADEN!*\n⏰ {datetime.now(SGT).strftime('%A %d %b')}\n\n"
+             f"💪 {get_quote()}\n\n🎯 Hit 0.7% today. Structure SL. Take 0.3-0.5% TP.\n_One day at a time to $1M_ 🚀",
+        parse_mode="Markdown")
+
+async def job_monday_brief(ctx: ContextTypes.DEFAULT_TYPE):
+    if datetime.now(SGT).weekday() != 0: return
+    await _send_monday_brief(ctx.bot)
+
+async def job_pre_london(ctx: ContextTypes.DEFAULT_TYPE):
+    if datetime.now(SGT).weekday() >= 5: return
+    bal = runtime_balance["value"]
+    await ctx.bot.send_message(chat_id=CHAT_ID,
+        text=f"⚡ *PRE-LONDON CHECKLIST*\n🇬🇧 Opens in 15 mins!\n\n"
+             f"☐ /news — any high impact events?\n☐ /sma — SMA crossover check?\n"
+             f"☐ /quick — AI signal ready?\n☐ Own chart confirms direction?\n"
+             f"☐ SL level identified on chart?\n☐ TP1: ${round(bal*0.003,2)} | TP2: ${round(bal*0.005,2)}\n\n"
+             f"⚠️ Score < 70 = WAIT | News in 2hrs = WAIT\n_Best: 3PM-8PM SGT_ 💪",
+        parse_mode="Markdown")
+
+async def job_ny_open(ctx: ContextTypes.DEFAULT_TYPE):
+    if datetime.now(SGT).weekday() >= 5: return
+    bal = runtime_balance["value"]
+    await ctx.bot.send_message(chat_id=CHAT_ID,
+        text=f"🗽 *NY SESSION OPEN*\n⏰ 8PM SGT — Overlap with London!\n\n"
+             f"💡 Most volatile 8PM-11PM SGT\n🎯 Daily target: ${round(bal*0.007,2)}\n\n"
+             f"Hit target already? → LOG OFF 🚫\nNot yet? → /quick or /sma first!\n\n"
+             f"⚠️ Check /news for US events!",
+        parse_mode="Markdown")
+
+async def job_eod_check(ctx: ContextTypes.DEFAULT_TYPE):
+    if datetime.now(SGT).weekday() >= 5: return
+    await ctx.bot.send_message(chat_id=CHAT_ID,
+        text=f"🌙 *END OF DAY CHECK-IN*\n⏰ {sgt_now()}\n\n"
+             f"📊 Reply with:\n1. Balance today\n2. Trades: W___ L___\n"
+             f"3. P&L: +/-$___\n4. Hit target? Y/N\n\n"
+             f"💪 {get_quote()}\n\n"
+             f"✅ Close all positions!\n✅ /setbalance [new amount]\n_Rest well. Tomorrow is a new day_ 🌟",
+        parse_mode="Markdown")
+
+# ── HANDLE MESSAGES ────────────────────────────────────────────────────────────
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
+    if not update.message: return
     text = update.message.text or update.message.caption or ""
     logger.info(f"MSG: {text[:60]}")
     if not text:
-        await update.message.reply_text("Empty message received.")
+        await update.message.reply_text("Empty message.")
         return
 
     is_forwarded = any([
@@ -735,8 +868,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if is_forwarded or is_signal:
         msg = await update.message.reply_text(
-            "⏳ *Cross-referencing signal...*\n_Fetching live data + Multi-TF analysis_",
-            parse_mode="Markdown"
+            "⏳ *Cross-referencing + SMA check...*", parse_mode="Markdown"
         )
         try:
             live = await get_all_live_data()
@@ -752,49 +884,51 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     a["current_price"] = str(raw)
             await msg.edit_text(format_crosscheck(a), parse_mode="Markdown")
         except Exception as e:
-            logger.error(f"Crosscheck error: {e}")
-            await msg.edit_text(
-                f"❌ Cross-check failed.\nTry /quick for analysis.\n`{str(e)[:150]}`",
-                parse_mode="Markdown"
-            )
+            await msg.edit_text(f"❌ Failed: {str(e)[:150]}\nTry /quick", parse_mode="Markdown")
     else:
         await update.message.reply_text(
-            "💬 No signal detected.\n\n"
-            "/signal — Full analysis\n"
-            "/quick — Fast analysis\n"
-            "/news — Market news\n"
-            "/risk — Risk calculator\n"
-            "Forward a signal to cross-check!"
+            "💬 No signal detected.\n/quick | /signal | /sma | /news\nForward a signal to cross-check!"
         )
 
 # ── ERROR HANDLER ──────────────────────────────────────────────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Exception: {context.error}")
+    logger.error(f"Error: {context.error}")
     try:
         if update and hasattr(update, "message") and update.message:
-            await update.message.reply_text(
-                f"⚠️ Error occurred. Try /quick or /signal.\n`{str(context.error)[:100]}`",
-                parse_mode="Markdown"
-            )
+            await update.message.reply_text(f"⚠️ Error. Try /quick.\n`{str(context.error)[:100]}`", parse_mode="Markdown")
     except Exception:
         pass
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
+# ── MAIN ───────────────────────────────────────────────────────────────────────
 def main():
+    import datetime as dt
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",       cmd_start))
-    app.add_handler(CommandHandler("signal",      cmd_signal))
-    app.add_handler(CommandHandler("quick",       cmd_quick))
-    app.add_handler(CommandHandler("news",        cmd_news))
-    app.add_handler(CommandHandler("risk",        cmd_risk))
-    app.add_handler(CommandHandler("setbalance",  cmd_setbalance))
-    app.add_handler(CommandHandler("crossref",    cmd_crossref))
-    app.add_handler(CommandHandler("rules",       cmd_rules))
-    app.add_handler(CommandHandler("status",      cmd_status))
+
+    # Commands
+    app.add_handler(CommandHandler("start",      cmd_start))
+    app.add_handler(CommandHandler("monday",     cmd_monday))
+    app.add_handler(CommandHandler("signal",     cmd_signal))
+    app.add_handler(CommandHandler("quick",      cmd_quick))
+    app.add_handler(CommandHandler("sma",        cmd_sma))
+    app.add_handler(CommandHandler("news",       cmd_news))
+    app.add_handler(CommandHandler("risk",       cmd_risk))
+    app.add_handler(CommandHandler("setbalance", cmd_setbalance))
+    app.add_handler(CommandHandler("crossref",   cmd_crossref))
+    app.add_handler(CommandHandler("rules",      cmd_rules))
+    app.add_handler(CommandHandler("status",     cmd_status))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
-    logger.info("⚖️ Aden Gold AI Bot v3.2 started!")
-    logger.info(f"⏰ SGT: {sgt_now()} | Balance: ${runtime_balance['value']}")
+
+    # Scheduled jobs (UTC = SGT - 8hrs)
+    jq = app.job_queue
+    jq.run_daily(job_morning_quote, time=dt.time(23, 0, 0))  # 7AM SGT
+    jq.run_daily(job_monday_brief,  time=dt.time(0,  0, 0))  # 8AM SGT Mon
+    jq.run_daily(job_pre_london,    time=dt.time(6, 45, 0))  # 2:45PM SGT
+    jq.run_daily(job_ny_open,       time=dt.time(12, 0, 0))  # 8PM SGT
+    jq.run_daily(job_eod_check,     time=dt.time(15, 0, 0))  # 11PM SGT
+
+    logger.info("⚖️ Aden Gold AI Bot v4.0 started!")
+    logger.info(f"⏰ {sgt_now()} | Balance: ${runtime_balance['value']}")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
