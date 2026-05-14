@@ -52,31 +52,41 @@ TRADE_LOG_FILE = os.environ.get("TRADE_LOG_FILE", "/tmp/trade_log.json")
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Increase Python recursion limit (defensive; safe wrappers should not recurse)
+import sys
+sys.setrecursionlimit(5000)
+
 
 # ── MARKDOWN-SAFE SEND HELPERS ──────────────────────────────────────────────
 def _strip_md(text: str) -> str:
     """Strip markdown chars for plain-text fallback."""
-    import re
-    # Remove inline markdown chars; keep content readable
-    cleaned = text
-    cleaned = cleaned.replace("*", "")
-    cleaned = cleaned.replace("`", "")
-    # Remove italic underscores (only those used as markup, not in URLs/words)
-    cleaned = re.sub(r'(?<=\W)_([^_\n]+)_(?=\W|$)', r'\1', cleaned)
+    if not isinstance(text, str):
+        try:
+            text = str(text)
+        except Exception:
+            return "(unprintable)"
+    # Remove all markdown chars; simpler and safer than regex
+    cleaned = text.replace("*", "").replace("`", "").replace("_", "")
     return cleaned
 
 
 async def safe_reply(update, text: str):
     """Reply with Markdown; fall back to plain text on parse failure."""
     try:
-        return await safe_reply(update, text)
+        return await update.message.reply_text(text, parse_mode="Markdown")
     except Exception as e:
-        logger.warning(f"Markdown failed, sending plain: {e}")
         try:
-            return await update.message.reply_text(_strip_md(text))
-        except Exception as e2:
-            logger.error(f"Plain send also failed: {e2}")
-            return None
+            logger.warning("Markdown reply failed: " + repr(e)[:200])
+        except Exception:
+            pass
+    try:
+        return await update.message.reply_text(_strip_md(text))
+    except Exception as e:
+        try:
+            logger.error("Plain reply also failed: " + repr(e)[:200])
+        except Exception:
+            pass
+    return None
 
 
 async def safe_bot_send(bot, chat_id: str, text: str):
@@ -84,25 +94,37 @@ async def safe_bot_send(bot, chat_id: str, text: str):
     try:
         return await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
     except Exception as e:
-        logger.warning(f"Markdown bot send failed, sending plain: {e}")
         try:
-            return await bot.send_message(chat_id=chat_id, text=_strip_md(text))
-        except Exception as e2:
-            logger.error(f"Plain bot send also failed: {e2}")
-            return None
+            logger.warning("Markdown bot send failed: " + repr(e)[:200])
+        except Exception:
+            pass
+    try:
+        return await bot.send_message(chat_id=chat_id, text=_strip_md(text))
+    except Exception as e:
+        try:
+            logger.error("Plain bot send also failed: " + repr(e)[:200])
+        except Exception:
+            pass
+    return None
 
 
 async def safe_edit(msg, text: str):
     """Edit with Markdown; fall back to plain text on parse failure."""
     try:
-        return await safe_edit(msg, text)
+        return await msg.edit_text(text, parse_mode="Markdown")
     except Exception as e:
-        logger.warning(f"Markdown edit failed, sending plain: {e}")
         try:
-            return await msg.edit_text(_strip_md(text))
-        except Exception as e2:
-            logger.error(f"Plain edit also failed: {e2}")
-            return None
+            logger.warning("Markdown edit failed: " + repr(e)[:200])
+        except Exception:
+            pass
+    try:
+        return await msg.edit_text(_strip_md(text))
+    except Exception as e:
+        try:
+            logger.error("Plain edit also failed: " + repr(e)[:200])
+        except Exception:
+            pass
+    return None
 
 
 def _today_key() -> str:
