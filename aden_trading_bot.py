@@ -53,6 +53,58 @@ logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 
+# ── MARKDOWN-SAFE SEND HELPERS ──────────────────────────────────────────────
+def _strip_md(text: str) -> str:
+    """Strip markdown chars for plain-text fallback."""
+    import re
+    # Remove inline markdown chars; keep content readable
+    cleaned = text
+    cleaned = cleaned.replace("*", "")
+    cleaned = cleaned.replace("`", "")
+    # Remove italic underscores (only those used as markup, not in URLs/words)
+    cleaned = re.sub(r'(?<=\W)_([^_\n]+)_(?=\W|$)', r'\1', cleaned)
+    return cleaned
+
+
+async def safe_reply(update, text: str):
+    """Reply with Markdown; fall back to plain text on parse failure."""
+    try:
+        return await safe_reply(update, text)
+    except Exception as e:
+        logger.warning(f"Markdown failed, sending plain: {e}")
+        try:
+            return await update.message.reply_text(_strip_md(text))
+        except Exception as e2:
+            logger.error(f"Plain send also failed: {e2}")
+            return None
+
+
+async def safe_bot_send(bot, chat_id: str, text: str):
+    """bot.send_message with Markdown; fall back to plain on parse failure."""
+    try:
+        return await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+    except Exception as e:
+        logger.warning(f"Markdown bot send failed, sending plain: {e}")
+        try:
+            return await bot.send_message(chat_id=chat_id, text=_strip_md(text))
+        except Exception as e2:
+            logger.error(f"Plain bot send also failed: {e2}")
+            return None
+
+
+async def safe_edit(msg, text: str):
+    """Edit with Markdown; fall back to plain text on parse failure."""
+    try:
+        return await safe_edit(msg, text)
+    except Exception as e:
+        logger.warning(f"Markdown edit failed, sending plain: {e}")
+        try:
+            return await msg.edit_text(_strip_md(text))
+        except Exception as e2:
+            logger.error(f"Plain edit also failed: {e2}")
+            return None
+
+
 def _today_key() -> str:
     return datetime.now(SGT).strftime("%Y-%m-%d")
 
@@ -1147,8 +1199,7 @@ def format_personal_analysis(a: dict, parsed: dict) -> str:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bal = runtime_balance["value"]
     pip = runtime_pip["value"]
-    await update.message.reply_text(
-        f"⚖️ *ADEN GOLD AI BOT v4.3*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+    await safe_reply(update, f"⚖️ *ADEN GOLD AI BOT v4.3*\n━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 SMA + RSI + MACD + Bollinger + Fib\n"
         f"🕯️ Candlestick pattern detection\n"
         f"💰 Live: OANDA + gold-api + Yahoo Finance\n"
@@ -1173,31 +1224,25 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"/status — Bot status\n\n"
         f"*Signal Channels (forward to bot):*\n"
         f"📊 United Signals | SureShotFX\n"
-        f"📊 FXPremiere | Uncle Lim Journey",
-        parse_mode="Markdown"
-    )
+        f"📊 FXPremiere | Uncle Lim Journey")
 
 
 async def cmd_sma(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text(
-        "⏳ *Calculating RSI, MACD, Bollinger, SMA, Fibonacci...*",
-        parse_mode="Markdown"
-    )
+    msg = await update.message.reply_text("⏳ Calculating RSI, MACD, Bollinger, SMA, Fibonacci...")
     t = await get_technical_analysis()
     if not t.get("available"):
-        await msg.edit_text("❌ Technical data unavailable.\nCheck OANDA_TOKEN in Render.", parse_mode="Markdown")
+        await safe_edit(msg, "❌ Technical data unavailable. Check OANDA_TOKEN in Render.")
         return
-    await msg.edit_text(
+    await safe_edit(msg,
         f"📊 *FULL TECHNICAL ANALYSIS — XAU/USD H1*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{format_tech_block(t)}\n"
-        f"⏰ {sgt_now()}",
-        parse_mode="Markdown"
+        f"⏰ {sgt_now()}"
     )
 
 
 async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ *Fetching live data + SMA + Claude analysis...*", parse_mode="Markdown")
+    msg = await update.message.reply_text("⏳ Fetching live data + SMA + Claude analysis...")
     try:
         live = await get_all_live_data()
         prompt = build_analysis_prompt(live)
@@ -1212,13 +1257,13 @@ async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             raw = parse_price(live["gold"])
             if raw > 0 and abs(parse_price(a.get("price", "0")) - raw) > 200:
                 a["price"] = str(raw)
-        await msg.edit_text(format_signal(a, source, live.get("sma")), parse_mode="Markdown")
+        await safe_edit(msg, format_signal(a, source, live.get("sma")))
     except Exception as e:
-        await msg.edit_text(f"❌ Failed: {str(e)[:150]}", parse_mode="Markdown")
+        await safe_edit(msg, f"❌ Failed: {str(e)[:150]}")
 
 
 async def cmd_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ *Fetching live price + Gemini analysis...*", parse_mode="Markdown")
+    msg = await update.message.reply_text("⏳ Fetching live price + Gemini analysis...")
     try:
         gold, dxy, oil = await asyncio.gather(
             get_live_price(), get_dxy_price(), get_oil_price(), return_exceptions=True
@@ -1234,18 +1279,18 @@ async def cmd_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             raw = parse_price(live["gold"])
             if raw > 0 and abs(parse_price(a.get("price", "0")) - raw) > 200:
                 a["price"] = str(raw)
-        await msg.edit_text(format_signal(a, "GEMINI", None), parse_mode="Markdown")
+        await safe_edit(msg, format_signal(a, "GEMINI", None))
     except Exception as e:
         logger.error(f"Quick error: {e}")
-        await msg.edit_text(f"❌ Gemini failed: {str(e)[:150]}\nTry /signal instead.", parse_mode="Markdown")
+        await safe_edit(msg, f"❌ Gemini failed: {str(e)[:150]}\nTry /signal instead.")
 
 
 async def cmd_news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ *Fetching latest news...*", parse_mode="Markdown")
+    msg = await update.message.reply_text("⏳ Fetching latest news...")
     try:
-        await msg.edit_text(format_news(await get_market_news()), parse_mode="Markdown")
+        await safe_edit(msg, format_news(await get_market_news()))
     except Exception as e:
-        await msg.edit_text(f"❌ News failed: {str(e)[:100]}", parse_mode="Markdown")
+        await safe_edit(msg, f"❌ News failed: {str(e)[:100]}")
 
 
 async def cmd_risk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1258,8 +1303,7 @@ async def cmd_risk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         session, rec = "New York 🇺🇸", "20-30 pips"
     else:
         session, rec = "Asian 🌏", "15-25 pips"
-    await update.message.reply_text(
-        f"💰 *RISK CALCULATOR*\n━━━━━━━━━━━━━━\n"
+    await safe_reply(update, f"💰 *RISK CALCULATOR*\n━━━━━━━━━━━━━━\n"
         f"💼 Balance: *${r['balance']:,.2f}*\n"
         f"📐 Pip: ${r['pip']} | Max: {MAX_RISK_PCT}%\n\n"
         f"Max/trade: *${r['max_loss']}*\n"
@@ -1269,32 +1313,24 @@ async def cmd_risk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Buffer: {SL_BUFFER_PIPS} pips beyond S/R\n\n"
         f"15p=${round(15*r['pip'],2)} | 25p=${round(25*r['pip'],2)} | "
         f"50p=${round(50*r['pip'],2)} | 100p=${round(100*r['pip'],2)}\n\n"
-        f"_/setbalance [amount] | /setunit [pip]_\n⏰ {ts}",
-        parse_mode="Markdown"
-    )
+        f"_/setbalance [amount] | /setunit [pip]_\n⏰ {ts}")
 
 
 async def cmd_setbalance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         args = ctx.args
         if not args:
-            await update.message.reply_text(
-                f"💼 Current: ${runtime_balance['value']:,.2f}\nUse: `/setbalance 2000`",
-                parse_mode="Markdown"
-            )
+            await safe_reply(update, f"💼 Current: ${runtime_balance['value']:,.2f}\nUse: `/setbalance 2000`")
             return
         new_bal = float(args[0].replace(",", "").replace("$", ""))
         old = runtime_balance["value"]
         runtime_balance["value"] = new_bal
         r = calculate_risk()
-        await update.message.reply_text(
-            f"✅ *Balance Updated!*\n${old:,.2f} → *${new_bal:,.2f}*\n\n"
+        await safe_reply(update, f"✅ *Balance Updated!*\n${old:,.2f} → *${new_bal:,.2f}*\n\n"
             f"Max/trade: ${r['max_loss']} | Daily: ${r['daily_max']}\n"
-            f"TP1: ${round(new_bal*0.003,2)} | TP2: ${round(new_bal*0.005,2)}",
-            parse_mode="Markdown"
-        )
+            f"TP1: ${round(new_bal*0.003,2)} | TP2: ${round(new_bal*0.005,2)}")
     except (IndexError, ValueError):
-        await update.message.reply_text("❌ Use: `/setbalance 2000`", parse_mode="Markdown")
+        await safe_reply(update, "❌ Use: `/setbalance 2000`")
 
 
 async def cmd_setunit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1302,32 +1338,26 @@ async def cmd_setunit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         args = ctx.args
         if not args:
-            await update.message.reply_text(
-                f"📐 Current pip value: *${runtime_pip['value']}*\n\n"
+            await safe_reply(update, f"📐 Current pip value: *${runtime_pip['value']}*\n\n"
                 f"Use: `/setunit 0.10` (for 0.01 lot)\n"
                 f"Use: `/setunit 1.00` (for 0.10 lot)\n\n"
                 f"_Pip value = profit/loss per 1 pip move._\n"
-                f"_Lower value = smaller lot = less risk._",
-                parse_mode="Markdown"
-            )
+                f"_Lower value = smaller lot = less risk._")
             return
         new_pip = float(args[0].replace(",", "").replace("$", ""))
         if new_pip <= 0 or new_pip > 100:
-            await update.message.reply_text("❌ Pip value must be > 0 and < 100", parse_mode="Markdown")
+            await safe_reply(update, "❌ Pip value must be > 0 and < 100")
             return
         old = runtime_pip["value"]
         runtime_pip["value"] = new_pip
         r = calculate_risk()
-        await update.message.reply_text(
-            f"✅ *Pip Value Updated!*\n${old} → *${new_pip}*\n\n"
+        await safe_reply(update, f"✅ *Pip Value Updated!*\n${old} → *${new_pip}*\n\n"
             f"📊 New risk profile:\n"
             f"Max/trade: ${r['max_loss']} ({MAX_RISK_PCT}%)\n"
             f"Rec SL: *{r['rec_sl']} pips*\n\n"
-            f"15p=${round(15*new_pip,2)} | 25p=${round(25*new_pip,2)} | 50p=${round(50*new_pip,2)}",
-            parse_mode="Markdown"
-        )
+            f"15p=${round(15*new_pip,2)} | 25p=${round(25*new_pip,2)} | 50p=${round(50*new_pip,2)}")
     except (IndexError, ValueError):
-        await update.message.reply_text("❌ Use: `/setunit 0.10`", parse_mode="Markdown")
+        await safe_reply(update, "❌ Use: `/setunit 0.10`")
 
 
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1357,8 +1387,7 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     daily_target = round(start_bal * 0.007, 2)
     pnl_pct = round((today["pnl"] / start_bal) * 100, 2) if start_bal > 0 else 0
 
-    await update.message.reply_text(
-        f"📅 *TODAY'S TRADING LOG*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+    await safe_reply(update, f"📅 *TODAY'S TRADING LOG*\n━━━━━━━━━━━━━━━━━━━━━━\n"
         f"⏰ {sgt_now()}\n\n"
         f"💼 Started: ${start_bal:,.2f}\n"
         f"💼 Current: ${bal:,.2f}\n"
@@ -1368,9 +1397,7 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"📈 Win rate: {win_rate}%"
         f"{loss_status}"
         f"{history}\n"
-        f"_/logwin [amt] or /logloss [amt] to update_",
-        parse_mode="Markdown"
-    )
+        f"_/logwin [amt] or /logloss [amt] to update_")
 
 
 async def cmd_logwin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1378,27 +1405,21 @@ async def cmd_logwin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         args = ctx.args
         if not args:
-            await update.message.reply_text(
-                "✅ *Log a winning trade*\nUse: `/logwin 13.30`\n_(amount in $ profit)_",
-                parse_mode="Markdown"
-            )
+            await safe_reply(update, "✅ *Log a winning trade*\nUse: `/logwin 13.30`\n_(amount in $ profit)_")
             return
         amount = float(args[0].replace(",", "").replace("$", ""))
         if amount <= 0:
-            await update.message.reply_text("❌ Amount must be positive", parse_mode="Markdown")
+            await safe_reply(update, "❌ Amount must be positive")
             return
         note = " ".join(args[1:]) if len(args) > 1 else ""
         entry = log_trade("win", amount, note)
         bal = runtime_balance["value"]
-        await update.message.reply_text(
-            f"✅ *WIN LOGGED!* +${amount:.2f}\n━━━━━━━━━━━━━━\n"
+        await safe_reply(update, f"✅ *WIN LOGGED!* +${amount:.2f}\n━━━━━━━━━━━━━━\n"
             f"💼 Balance: ${bal:,.2f}\n"
             f"📊 Today: {entry['wins']}W / {entry['losses']}L | P&L: ${entry['pnl']:+.2f}\n\n"
-            f"🎯 _Take profit. Don't get greedy._",
-            parse_mode="Markdown"
-        )
+            f"🎯 _Take profit. Don't get greedy._")
     except (IndexError, ValueError):
-        await update.message.reply_text("❌ Use: `/logwin 13.30`", parse_mode="Markdown")
+        await safe_reply(update, "❌ Use: `/logwin 13.30`")
 
 
 async def cmd_logloss(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1406,14 +1427,11 @@ async def cmd_logloss(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         args = ctx.args
         if not args:
-            await update.message.reply_text(
-                "🔴 *Log a losing trade*\nUse: `/logloss 20.00`\n_(amount in $ loss)_",
-                parse_mode="Markdown"
-            )
+            await safe_reply(update, "🔴 *Log a losing trade*\nUse: `/logloss 20.00`\n_(amount in $ loss)_")
             return
         amount = float(args[0].replace(",", "").replace("$", ""))
         if amount <= 0:
-            await update.message.reply_text("❌ Amount must be positive", parse_mode="Markdown")
+            await safe_reply(update, "❌ Amount must be positive")
             return
         note = " ".join(args[1:]) if len(args) > 1 else ""
         entry = log_trade("loss", amount, note)
@@ -1431,15 +1449,12 @@ async def cmd_logloss(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif entry["losses"] == 1:
             rule7 = f"\n⚠️ _1 loss today. 1 more = mandatory stop._"
 
-        await update.message.reply_text(
-            f"🔴 *LOSS LOGGED.* -${amount:.2f}\n━━━━━━━━━━━━━━\n"
+        await safe_reply(update, f"🔴 *LOSS LOGGED.* -${amount:.2f}\n━━━━━━━━━━━━━━\n"
             f"💼 Balance: ${bal:,.2f}\n"
             f"📊 Today: {entry['wins']}W / {entry['losses']}L | P&L: ${entry['pnl']:+.2f}"
-            f"{rule7}",
-            parse_mode="Markdown"
-        )
+            f"{rule7}")
     except (IndexError, ValueError):
-        await update.message.reply_text("❌ Use: `/logloss 20.00`", parse_mode="Markdown")
+        await safe_reply(update, "❌ Use: `/logloss 20.00`")
 
 
 async def cmd_pattern(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1450,12 +1465,9 @@ async def cmd_pattern(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Check if we have any data
     total_days = sum(s["days"] for s in stats.values())
     if total_days == 0:
-        await update.message.reply_text(
-            "📊 *No pattern data yet.*\n"
+        await safe_reply(update, "📊 *No pattern data yet.*\n"
             "Log trades with /logwin and /logloss first.\n"
-            "Pattern unlocks after a few days of data.",
-            parse_mode="Markdown"
-        )
+            "Pattern unlocks after a few days of data.")
         return
 
     # Build the table
@@ -1515,25 +1527,21 @@ async def cmd_pattern(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines.append(f"⏰ {sgt_now()}")
     lines.append(f"Data updates as you /logwin and /logloss")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await safe_reply(update, "\n".join(lines))
 
 
 
-    await update.message.reply_text(
-        "📨 *Cross-Reference:*\n\n"
+    await safe_reply(update, "📨 *Cross-Reference:*\n\n"
         "1. Open signal channel\n2. Long press message\n"
         "3. Tap Forward\n4. Select @AdenGoldAI_bot ✅\n\n"
         "Or paste signal text here!\n\n"
-        "✅ CONFIRMED = Trade | ⚠️ MIXED = Careful | ❌ REJECTED = Skip",
-        parse_mode="Markdown"
-    )
+        "✅ CONFIRMED = Trade | ⚠️ MIXED = Careful | ❌ REJECTED = Skip")
 
 
 async def cmd_rules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bal = runtime_balance["value"]
     r = calculate_risk()
-    await update.message.reply_text(
-        f"📋 *ADEN'S RULES v4.3*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+    await safe_reply(update, f"📋 *ADEN'S RULES v4.3*\n━━━━━━━━━━━━━━━━━━━━━━\n"
         f"★ R1: Gold only, no USD/JPY (intervention)\n"
         f"★ R2: SL BEFORE entry always\n"
         f"★ R3: Structure SL + {SL_BUFFER_PIPS} pip buffer\n"
@@ -1561,15 +1569,12 @@ async def cmd_rules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Max loss/trade: ${r['max_loss']} ({MAX_RISK_PCT}%)\n"
         f"TP1: ${round(bal*0.003,2)} | TP2: ${round(bal*0.005,2)}\n"
         f"\n"
-        f"*SAR:* SET → ADJUST → RUN",
-        parse_mode="Markdown"
-    )
+        f"*SAR:* SET → ADJUST → RUN")
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     today = get_today_log()
-    await update.message.reply_text(
-        f"🤖 *BOT STATUS v4.3*\n━━━━━━━━━━━━━━\n"
+    await safe_reply(update, f"🤖 *BOT STATUS v4.3*\n━━━━━━━━━━━━━━\n"
         f"✅ Online | ⏰ {sgt_now()}\n"
         f"💼 Balance: ${runtime_balance['value']:,.2f}\n"
         f"📐 Pip value: ${runtime_pip['value']}\n"
@@ -1578,9 +1583,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🤖 Claude Haiku + Gemini 2.5 Flash\n\n"
         f"📅 *Today:* {today['wins']}W / {today['losses']}L | P&L: ${today['pnl']:+.2f}\n\n"
         f"*Channels:* United Signals | SureShotFX\n"
-        f"FXPremiere | Uncle Lim Journey",
-        parse_mode="Markdown"
-    )
+        f"FXPremiere | Uncle Lim Journey")
 
 
 async def cmd_monday(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1618,20 +1621,19 @@ async def _send_monday_brief(bot=None, update=None):
         f"Type /news | /sma | /quick to start!"
     )
     if bot:
-        await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="Markdown")
+        await safe_bot_send(bot, CHAT_ID, text)
     elif update:
-        await update.message.reply_text(text, parse_mode="Markdown")
+        await safe_reply(update, text)
 
 
 # ── SCHEDULED JOBS ─────────────────────────────────────────────────────────────
 async def job_morning_quote(ctx: ContextTypes.DEFAULT_TYPE):
     if datetime.now(SGT).weekday() >= 5:
         return
-    await ctx.bot.send_message(
-        chat_id=CHAT_ID,
-        text=f"☀️ *GOOD MORNING ADEN!*\n📅 {datetime.now(SGT).strftime('%A %d %b')}\n\n"
-             f"💪 {get_quote()}\n\n🎯 Hit 0.7% today. Structure SL. Take 0.3-0.5% TP.\n_One day at a time._",
-        parse_mode="Markdown"
+    await safe_bot_send(ctx.bot, CHAT_ID,
+        f"☀️ *GOOD MORNING ADEN!*\n📅 {datetime.now(SGT).strftime('%A %d %b')}\n\n"
+        f"💪 {get_quote()}\n\n🎯 Hit 0.7% today. Structure SL. Take 0.3-0.5% TP.\n"
+        f"One day at a time."
     )
 
 
@@ -1645,14 +1647,13 @@ async def job_pre_london(ctx: ContextTypes.DEFAULT_TYPE):
     if datetime.now(SGT).weekday() >= 5:
         return
     bal = runtime_balance["value"]
-    await ctx.bot.send_message(
-        chat_id=CHAT_ID,
-        text=f"⚡ *PRE-LONDON CHECKLIST*\n🇬🇧 Opens in 15 mins!\n\n"
-             f"☐ /news — any high impact events?\n☐ /sma — SMA crossover check?\n"
-             f"☐ /quick — AI signal ready?\n☐ Own chart confirms direction?\n"
-             f"☐ SL level identified on chart?\n☐ TP1: ${round(bal*0.003,2)} | TP2: ${round(bal*0.005,2)}\n\n"
-             f"⚠️ Score < 70 = WAIT | News in 2hrs = WAIT\n_Best: 3PM-8PM SGT_ 💪",
-        parse_mode="Markdown"
+    await safe_bot_send(ctx.bot, CHAT_ID,
+        f"⚡ *PRE-LONDON CHECKLIST*\n🇬🇧 Opens in 15 mins!\n\n"
+        f"☐ /news — any high impact events?\n☐ /sma — SMA crossover check?\n"
+        f"☐ /quick — AI signal ready?\n☐ Own chart confirms direction?\n"
+        f"☐ SL level identified on chart?\n☐ TP1: ${round(bal*0.003,2)} | TP2: ${round(bal*0.005,2)}\n\n"
+        f"⚠️ Score below 70 = WAIT | News in 2hrs = WAIT\n"
+        f"Best: 3PM-8PM SGT 💪"
     )
 
 
@@ -1660,13 +1661,11 @@ async def job_ny_open(ctx: ContextTypes.DEFAULT_TYPE):
     if datetime.now(SGT).weekday() >= 5:
         return
     bal = runtime_balance["value"]
-    await ctx.bot.send_message(
-        chat_id=CHAT_ID,
-        text=f"🇺🇸 *NY SESSION OPEN*\n⏰ 8PM SGT — Overlap with London!\n\n"
-             f"💎 Most volatile 8PM-11PM SGT\n🎯 Daily target: ${round(bal*0.007,2)}\n\n"
-             f"Hit target already? → LOG OFF 🚫\nNot yet? → /quick or /sma first!\n\n"
-             f"⚠️ Check /news for US events!",
-        parse_mode="Markdown"
+    await safe_bot_send(ctx.bot, CHAT_ID,
+        f"🇺🇸 *NY SESSION OPEN*\n⏰ 8PM SGT — Overlap with London!\n\n"
+        f"💎 Most volatile 8PM-11PM SGT\n🎯 Daily target: ${round(bal*0.007,2)}\n\n"
+        f"Hit target already? Then LOG OFF 🚫\nNot yet? Run /quick or /sma first!\n\n"
+        f"⚠️ Check /news for US events!"
     )
 
 
@@ -1674,16 +1673,15 @@ async def job_eod_check(ctx: ContextTypes.DEFAULT_TYPE):
     if datetime.now(SGT).weekday() >= 5:
         return
     today = get_today_log()
-    await ctx.bot.send_message(
-        chat_id=CHAT_ID,
-        text=f"🌙 *END OF DAY CHECK-IN*\n⏰ {sgt_now()}\n\n"
-             f"📊 *Auto-log says:*\n"
-             f"Wins: {today['wins']} | Losses: {today['losses']}\n"
-             f"P&L: ${today['pnl']:+.2f}\n"
-             f"Balance: ${runtime_balance['value']:,.2f}\n\n"
-             f"💪 {get_quote()}\n\n"
-             f"✅ Close all positions!\n✅ /today for full log\n_Rest well. Tomorrow is another chance._ 🌙",
-        parse_mode="Markdown"
+    await safe_bot_send(ctx.bot, CHAT_ID,
+        f"🌙 *END OF DAY CHECK-IN*\n⏰ {sgt_now()}\n\n"
+        f"📊 *Auto-log says:*\n"
+        f"Wins: {today['wins']} | Losses: {today['losses']}\n"
+        f"P&L: ${today['pnl']:+.2f}\n"
+        f"Balance: ${runtime_balance['value']:,.2f}\n\n"
+        f"💪 {get_quote()}\n\n"
+        f"✅ Close all positions\n✅ /today for full log\n"
+        f"Rest well. Tomorrow is another chance. 🌙"
     )
 
 
@@ -1717,8 +1715,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Aden's own analysis
     if is_personal and not is_forwarded:
         msg = await update.message.reply_text(
-            "🎯 *Reviewing your analysis...*\n_Fetching live data + indicators_",
-            parse_mode="Markdown"
+            "🎯 Reviewing your analysis...\nFetching live data + indicators"
         )
         try:
             parsed = parse_personal_analysis(text)
@@ -1737,16 +1734,15 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 a = await claude_analysis(prompt)
             except Exception:
                 a = await gemini_analysis(prompt)
-            await msg.edit_text(format_personal_analysis(a, parsed), parse_mode="Markdown")
+            await safe_edit(msg, format_personal_analysis(a, parsed))
         except Exception as e:
             logger.error(f"Personal analysis error: {e}")
-            await msg.edit_text(f"❌ Failed: {str(e)[:150]}\nTry /signal instead.", parse_mode="Markdown")
+            await safe_edit(msg, f"❌ Failed: {str(e)[:150]}\nTry /signal instead.")
 
     # Forwarded channel signal
     elif is_forwarded or is_signal:
         msg = await update.message.reply_text(
-            "⏳ *Cross-referencing signal...*\n_Fetching live data + indicators_",
-            parse_mode="Markdown"
+            "⏳ Cross-referencing signal...\nFetching live data + indicators"
         )
         try:
             live = await get_all_live_data()
@@ -1760,26 +1756,22 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 raw = parse_price(live["gold"])
                 if raw > 0 and abs(parse_price(a.get("current_price", "0")) - raw) > 200:
                     a["current_price"] = str(raw)
-            await msg.edit_text(format_crosscheck(a), parse_mode="Markdown")
+            await safe_edit(msg, format_crosscheck(a))
         except Exception as e:
-            await msg.edit_text(f"❌ Failed: {str(e)[:150]}\nTry /quick", parse_mode="Markdown")
+            await safe_edit(msg, f"❌ Failed: {str(e)[:150]}\nTry /quick")
 
     else:
-        await update.message.reply_text(
+        await safe_reply(update,
             "💬 *How to use bot:*\n\n"
             "*Your own analysis:*\n"
             "Type e.g.:\n"
             "`BUY 4700 TP 4720 SL 4685`\n"
             "`SELL 4750 target 4720 stop 4765`\n"
-            "_Bot reviews your setup!_ 🎯\n\n"
-            "*Forward channel signal:*\n"
-            "Forward from United Signals etc\n"
-            "_Bot cross-checks it!_ 🔄\n\n"
+            "Bot reviews your setup 🎯\n\n"
             "*Log trades:*\n"
             "`/logwin 13.30` | `/logloss 20.00`\n"
             "`/today` for daily summary\n\n"
-            "/quick | /signal | /sma | /news",
-            parse_mode="Markdown"
+            "/quick | /signal | /sma | /news | /pattern"
         )
 
 
