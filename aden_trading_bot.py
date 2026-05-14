@@ -1168,7 +1168,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"/logloss [amt] — Log losing trade\n"
         f"/pattern — Weekday breakdown 🆕\n\n"
         f"*Reference:*\n"
-        f"/crossref — Forward signal guide\n"
         f"/rules — Trading rules (15 rules!)\n"
         f"/status — Bot status\n\n"
         f"*Signal Channels (forward to bot):*\n"
@@ -1811,7 +1810,6 @@ def main():
     app.add_handler(CommandHandler("logloss",    cmd_logloss))
 
     # Reference commands
-    app.add_handler(CommandHandler("crossref",   cmd_crossref))
     app.add_handler(CommandHandler("rules",      cmd_rules))
     app.add_handler(CommandHandler("status",     cmd_status))
     app.add_handler(CommandHandler("pattern",    cmd_pattern))
