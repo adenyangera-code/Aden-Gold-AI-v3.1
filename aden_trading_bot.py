@@ -1552,14 +1552,6 @@ async def cmd_pattern(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await safe_reply(update, "\n".join(lines))
 
 
-
-    await safe_reply(update, "📨 *Cross-Reference:*\n\n"
-        "1. Open signal channel\n2. Long press message\n"
-        "3. Tap Forward\n4. Select @AdenGoldAI_bot ✅\n\n"
-        "Or paste signal text here!\n\n"
-        "✅ CONFIRMED = Trade | ⚠️ MIXED = Careful | ❌ REJECTED = Skip")
-
-
 async def cmd_rules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bal = runtime_balance["value"]
     r = calculate_risk()
