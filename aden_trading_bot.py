@@ -869,6 +869,137 @@ def is_trading_signal(text: str) -> bool:
                 "limit","breakout","support","resistance","bullish","bearish"]
     return sum(1 for k in keywords if k in text.lower()) >= 1
 
+def is_personal_analysis(text: str) -> bool:
+    """Detect if user typed their own BUY/SELL analysis"""
+    t = text.lower().strip()
+    # Must have direction AND price
+    has_direction = any(w in t for w in ["buy", "sell", "long", "short"])
+    has_price = any(c.isdigit() for c in t)
+    has_analysis = any(w in t for w in [
+        "tp", "sl", "target", "stop", "entry", "support",
+        "resistance", "rsi", "sma", "dxy", "pattern",
+        "hammer", "engulf", "oversold", "overbought",
+        "candle", "bounce", "break", "hold"
+    ])
+    return has_direction and has_price and (has_analysis or len(t.split()) >= 3)
+
+def parse_personal_analysis(text: str) -> dict:
+    """Extract BUY/SELL, price, TP, SL from user text"""
+    import re
+    t = text.lower()
+
+    # Direction
+    direction = "BUY" if any(w in t for w in ["buy","long"]) else "SELL" if any(w in t for w in ["sell","short"]) else "UNKNOWN"
+
+    # Extract numbers with context
+    numbers = re.findall(r'[\d,]+\.?\d*', text)
+    numbers = [float(n.replace(',','')) for n in numbers if 1000 < float(n.replace(',','')) < 100000]
+
+    # Try to find TP and SL
+    tp_match = re.search(r'tp[:\s]*[\$]?([\d,]+\.?\d*)', t)
+    sl_match = re.search(r'sl[:\s]*[\$]?([\d,]+\.?\d*)', t)
+    entry_match = re.search(r'(entry|at|@)[:\s]*[\$]?([\d,]+\.?\d*)', t)
+
+    tp = float(tp_match.group(1).replace(',','')) if tp_match else 0
+    sl = float(sl_match.group(1).replace(',','')) if sl_match else 0
+    entry = float(entry_match.group(2).replace(',','')) if entry_match else (numbers[0] if numbers else 0)
+
+    return {
+        "direction": direction,
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "original_text": text
+    }
+
+def build_personal_analysis_prompt(user_text: str, parsed: dict, live: dict, tech: dict) -> str:
+    today = sgt_full()
+    gold_h = f"LIVE XAU/USD: ${live['gold']}" if live["gold"] else "Search current gold price"
+    dxy_h  = f"LIVE DXY: {live['dxy']}" if live["dxy"] else "Search DXY"
+    oil_h  = f"LIVE OIL: ${live['oil']}" if live["oil"] else "Search oil"
+
+    tech_ctx = ""
+    if tech.get("available"):
+        tech_ctx = (
+            f"\nLIVE INDICATORS FROM OANDA CANDLES:\n"
+            f"RSI14: {tech['rsi']} ({tech['rsi_signal']})\n"
+            f"MACD: {tech['macd_trend']} (hist: {tech['macd_hist']})\n"
+            f"SMA20: {tech['sma20']} | SMA50: {tech['sma50']} | SMA200: {tech['sma200']}\n"
+            f"Price {'ABOVE' if tech['above_sma20'] else 'BELOW'} SMA20 | "
+            f"Price {'ABOVE' if tech['above_sma50'] else 'BELOW'} SMA50\n"
+            f"BB: {tech['bb_position']} (upper:{tech['bb_upper']} lower:{tech['bb_lower']})\n"
+            f"Pattern: {tech['pattern']}\n"
+            f"Nearest Fib: {tech['nearest_fib']}\n"
+            f"Tech Score: {tech['tech_score']} ({tech['signal']})"
+        )
+
+    return f"""You are Aden Yang professional gold trading AI. {today}
+
+{gold_h} | {dxy_h} | {oil_h}
+{tech_ctx}
+
+ADEN'S OWN ANALYSIS:
+{user_text}
+
+Parsed: Direction={parsed['direction']} Entry=${parsed['entry']} TP=${parsed['tp']} SL=${parsed['sl']}
+
+YOUR TASK:
+1. Review Aden's analysis against live indicators above
+2. Search web for latest news that supports or challenges his view
+3. Agree or disagree with each point he made
+4. Suggest improvements to entry/SL/TP if needed
+5. Give overall verdict
+
+RULES:
+- Be direct and honest — agree OR disagree clearly
+- If SL too wide or too tight, say so
+- Check if entry is at good level vs SMA/Fibonacci
+- Warn if news risk present
+
+Return ONLY valid JSON:
+{{"direction":"{parsed['direction']}","entry_valid":true,"entry_comment":"price is at SMA50 support","sl_valid":true,"sl_comment":"SL below key structure level","tp_valid":true,"tp_comment":"TP at resistance level","ai_direction":"{parsed['direction']}","ai_agrees":true,"agreement_pct":85,"recommended_entry":"{parsed['entry']}","recommended_sl":"4683","recommended_tp1":"4715","recommended_tp2":"4735","recommended_rr":"1:2","rsi_confirms":true,"macd_confirms":true,"sma_confirms":true,"news_supports":true,"iran_update":"Peace talks ongoing","dxy_trend":"falling","what_you_missed":"Weekly trend still bearish — trade smaller","warning":"","verdict":"CONFIRMED","reason":"Your analysis is correct. RSI oversold at SMA50 support confirms buy."}}"""
+
+def format_personal_analysis(a: dict, parsed: dict) -> str:
+    ts = get_session_label()
+    ve = {"CONFIRMED":"✅","MIXED":"⚠️","REJECTED":"❌"}.get(a.get("verdict","MIXED"),"❓")
+    chk = lambda x: "✅" if x else "❌"
+    agree_bar = "█" * (a.get("agreement_pct",0)//10) + "░" * (10 - a.get("agreement_pct",0)//10)
+    risk_block = format_risk_block(
+        str(a.get("recommended_entry","0")),
+        str(a.get("recommended_sl","0"))
+    )
+    return (
+        f"👁️ *ADEN'S ANALYSIS REVIEW*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{ve} *{a.get('verdict','—')}* | {agree_bar} {a.get('agreement_pct',0)}% agree\n\n"
+        f"*Your Setup:*\n"
+        f"{'🟢' if parsed['direction']=='BUY' else '🔴'} {parsed['direction']} "
+        f"@ ${parsed['entry']} | TP:${parsed['tp']} | SL:${parsed['sl']}\n\n"
+        f"*AI Assessment:*\n"
+        f"{'🟢' if a.get('ai_agrees') else '🔴'} AI says: {a.get('ai_direction','—')}\n\n"
+        f"*Point by Point:*\n"
+        f"{chk(a.get('entry_valid'))} Entry: _{a.get('entry_comment','—')}_\n"
+        f"{chk(a.get('sl_valid'))} SL: _{a.get('sl_comment','—')}_\n"
+        f"{chk(a.get('tp_valid'))} TP: _{a.get('tp_comment','—')}_\n\n"
+        f"*Indicator Confirms:*\n"
+        f"{chk(a.get('rsi_confirms'))} RSI | "
+        f"{chk(a.get('macd_confirms'))} MACD | "
+        f"{chk(a.get('sma_confirms'))} SMA | "
+        f"{chk(a.get('news_supports'))} News\n\n"
+        f"🎯 *Recommended SAR:*\n"
+        f"┌ 📍 Entry: `${a.get('recommended_entry','—')}`\n"
+        f"│ 🛑 SL:    `${a.get('recommended_sl','—')}` ✅\n"
+        f"│ 🎯 TP1:   `${a.get('recommended_tp1','—')}`\n"
+        f"│ 🏆 TP2:   `${a.get('recommended_tp2','—')}`\n"
+        f"└ ⚖️  R:R:   `{a.get('recommended_rr','—')}`\n"
+        f"{risk_block}\n\n"
+        f"💡 _{a.get('reason','—')}_\n"
+        f"{'🔍 *Missed:* _'+a.get('what_you_missed')+'_' if a.get('what_you_missed') else ''}\n"
+        f"{'⚠️ '+a.get('warning') if a.get('warning') else ''}\n"
+        f"📉 DXY: {a.get('dxy_trend','—')} | 🌍 _{a.get('iran_update','—')}_\n"
+        f"⏰ {ts}\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ SL before entry | Max 2u | 0.7-1% target"
+    )
+
 # ── COMMANDS ───────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bal = runtime_balance["value"]
@@ -1164,12 +1295,46 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         getattr(update.message, "forward_from_chat", None) is not None,
         getattr(update.message, "forward_origin", None) is not None,
     ])
-    is_signal = is_trading_signal(text)
-    logger.info(f"forwarded:{is_forwarded} signal:{is_signal}")
+    is_signal   = is_trading_signal(text)
+    is_personal = is_personal_analysis(text) and not is_forwarded
+    logger.info(f"forwarded:{is_forwarded} signal:{is_signal} personal:{is_personal}")
 
-    if is_forwarded or is_signal:
+    # ── ADEN'S OWN ANALYSIS ────────────────────────────────────────────────────
+    if is_personal and not is_forwarded:
         msg = await update.message.reply_text(
-            "⏳ *Cross-referencing + SMA check...*", parse_mode="Markdown"
+            "👁️ *Reviewing your analysis...*\n_Fetching live data + indicators_",
+            parse_mode="Markdown"
+        )
+        try:
+            parsed = parse_personal_analysis(text)
+            gold, dxy, oil, tech = await asyncio.gather(
+                get_live_price(), get_dxy_price(), get_oil_price(),
+                get_technical_analysis(), return_exceptions=True
+            )
+            live = {
+                "gold": gold if isinstance(gold, str) else "",
+                "dxy":  dxy  if isinstance(dxy,  str) else "",
+                "oil":  oil  if isinstance(oil,  str) else "",
+            }
+            t = tech if isinstance(tech, dict) else {"available": False}
+            prompt = build_personal_analysis_prompt(text, parsed, live, t)
+            try:
+                a = await claude_analysis(prompt)
+            except Exception:
+                a = await gemini_analysis(prompt)
+            await msg.edit_text(format_personal_analysis(a, parsed), parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Personal analysis error: {e}")
+            await msg.edit_text(
+                f"❌ Failed: {str(e)[:150]}\nTry /signal instead.",
+                parse_mode="Markdown"
+            )
+
+    # ── FORWARDED CHANNEL SIGNAL ───────────────────────────────────────────────
+    elif is_forwarded or is_signal:
+        msg = await update.message.reply_text(
+            "⏳ *Cross-referencing signal...*\n_Fetching live data + indicators_",
+            parse_mode="Markdown"
         )
         try:
             live = await get_all_live_data()
@@ -1186,9 +1351,21 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(format_crosscheck(a), parse_mode="Markdown")
         except Exception as e:
             await msg.edit_text(f"❌ Failed: {str(e)[:150]}\nTry /quick", parse_mode="Markdown")
+
+    # ── NO SIGNAL DETECTED ─────────────────────────────────────────────────────
     else:
         await update.message.reply_text(
-            "💬 No signal detected.\n/quick | /signal | /sma | /news\nForward a signal to cross-check!"
+            "💬 *How to use bot:*\n\n"
+            "*Your own analysis:*\n"
+            "Type e.g.:\n"
+            "`BUY 4700 TP 4720 SL 4685`\n"
+            "`SELL 4750 target 4720 stop 4765`\n"
+            "_Bot reviews your setup!_ 👁️\n\n"
+            "*Forward channel signal:*\n"
+            "Forward from United Signals etc\n"
+            "_Bot cross-checks it!_ 🔄\n\n"
+            "/quick | /signal | /sma | /news",
+            parse_mode="Markdown"
         )
 
 # ── ERROR HANDLER ──────────────────────────────────────────────────────────────
