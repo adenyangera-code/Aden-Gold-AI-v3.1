@@ -130,9 +130,9 @@ def get_loss_warning() -> str:
     today = get_today_log()
     if today["losses"] >= LOSS_LIMIT_PER_DAY:
         return (
-            f"🛑 *RULE 7 ALERT — {today['losses']} LOSSES TODAY*\n"
-            f"_Aden's rule: 2 losses = STOP for the day._\n"
-            f"_Today P&L: ${today['pnl']:+.2f} | Take the break._\n"
+            f"🛑 *RULE 7 ALERT*\n"
+            f"{today['losses']} losses today. Stop trading.\n"
+            f"Today P&L: ${today['pnl']:+.2f}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
         )
     return ""
@@ -148,18 +148,19 @@ def get_thursday_warning() -> str:
     # Danger window: 8-10PM SGT (US jobless claims @ 8:30PM)
     if 20 <= hour < 22:
         return (
-            f"🔴 *RULE 15 — THURSDAY DANGER ZONE*\n"
-            f"_8-10PM = US Jobless Claims window._\n"
-            f"_Journal data: Thursdays lose $96/day on avg._\n"
-            f"_Consider WAITING for data to settle._\n"
+            f"🔴 *RULE 15 — THURSDAY DANGER*\n"
+            f"8 to 10 PM is Jobless Claims window.\n"
+            f"Journal: Thursdays lose $96 per day avg.\n"
+            f"Wait for data to settle.\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
         )
     # General Thursday warning
     return (
         f"⚠️ *RULE 15 — THURSDAY HALF DAY*\n"
-        f"_Thursdays lose $96/day on avg (1/5 wins)._\n"
-        f"_Use 50% position size. No overnight._\n"
-        f"_Run /news before any trade._\n"
+        f"Thursdays lose $96 per day on avg.\n"
+        f"Use 50 percent position size.\n"
+        f"No overnight positions.\n"
+        f"Run /news before any trade.\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
     )
 
@@ -1494,11 +1495,12 @@ async def cmd_pattern(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if worst_day and worst_day[1]["pnl"] < 0:
         wname, ws = worst_day
         wavg = ws["pnl"] / ws["days"]
+        win_rate = 100 * ws["win_days"] / ws["days"]
         lines.append(f"🔴 *Worst Day: {wname}*")
-        lines.append(f"_${ws['pnl']:+.2f} across {ws['days']} {wname}s "
-                     f"({100*ws['win_days']/ws['days']:.0f}% win rate)_")
+        lines.append(f"${ws['pnl']:+.2f} across {ws['days']} {wname}s "
+                     f"({win_rate:.0f}% win rate)")
         if wname == "Thu":
-            lines.append(f"_→ Rule 15 active — Thursday is HALF DAY!_")
+            lines.append(f"Rule 15 active. Thursday is HALF DAY.")
         lines.append(f"")
 
     # Best day callout
@@ -1506,12 +1508,12 @@ async def cmd_pattern(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         bname, bs = best_day
         bavg = bs["pnl"] / bs["days"]
         lines.append(f"🟢 *Best Day: {bname}*")
-        lines.append(f"_${bs['pnl']:+.2f} across {bs['days']} {bname}s_")
-        lines.append(f"_→ Concentrate position size on {bname}s_")
+        lines.append(f"${bs['pnl']:+.2f} across {bs['days']} {bname}s")
+        lines.append(f"Concentrate position size on {bname}s")
         lines.append(f"")
 
     lines.append(f"⏰ {sgt_now()}")
-    lines.append(f"_Data updates as you /logwin and /logloss_")
+    lines.append(f"Data updates as you /logwin and /logloss")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -1532,31 +1534,34 @@ async def cmd_rules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     r = calculate_risk()
     await update.message.reply_text(
         f"📋 *ADEN'S RULES v4.3*\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"★ R1: Gold only — no USD/JPY (intervention!)\n"
+        f"★ R1: Gold only, no USD/JPY (intervention)\n"
         f"★ R2: SL BEFORE entry always\n"
         f"★ R3: Structure SL + {SL_BUFFER_PIPS} pip buffer\n"
         f"★ R4: Never average down\n"
         f"★ R5: Partial closes lock profit\n"
         f"★ R6: No trading before major news\n"
-        f"★ R7: 2 losses = STOP! (auto-warning on)\n"
+        f"★ R7: 2 losses = STOP (auto-warning on)\n"
         f"★ R8: Small wins compound\n"
         f"★ R9: AI bot + own chart = both confirm\n"
-        f"★ R10: Score ≥ 70 to trade\n"
+        f"★ R10: Score 70 or higher to trade\n"
         f"★ R11: London + NY only (3-11PM SGT)\n"
         f"★ R12: Low confidence = skip\n"
-        f"★ R13: Daily target 0.7-1% = ${round(bal*0.007,2)}-${round(bal*0.01,2)}\n"
-        f"★ R14: Take profit at 0.3%, 0.5%, 1% — never wait\n"
-        f"🔴 *R15: THURSDAY HALF DAY* (NEW!)\n"
-        f"    • No trading 8-10PM SGT (Jobless Claims)\n"
-        f"    • No overnight Thu→Fri positions\n"
-        f"    • 50% position size on Thursdays\n"
-        f"    • Mandatory /news check before any trade\n"
-        f"    • _Journal data: Thursdays lose $96/day avg_\n\n"
-        f"💰 *RISK:*\n"
+        f"★ R13: Daily target 0.7-1 percent\n"
+        f"       = ${round(bal*0.007,2)} to ${round(bal*0.01,2)}\n"
+        f"★ R14: Take profit at 0.3, 0.5, 1 percent\n"
+        f"\n"
+        f"🔴 *R15: THURSDAY HALF DAY* (NEW)\n"
+        f"   No trading 8-10PM SGT (Jobless Claims)\n"
+        f"   No overnight Thu to Fri positions\n"
+        f"   50 percent position size on Thursdays\n"
+        f"   Mandatory /news check before any trade\n"
+        f"   Journal data: Thursdays lose $96/day avg\n"
+        f"\n"
+        f"💰 *RISK*\n"
         f"Max loss/trade: ${r['max_loss']} ({MAX_RISK_PCT}%)\n"
-        f"TP1: ${round(bal*0.003,2)} | TP2: ${round(bal*0.005,2)}\n\n"
-        f"*SAR:* SET → ADJUST → RUN\n"
-        f"_Small profits compound to millions!_ 💪",
+        f"TP1: ${round(bal*0.003,2)} | TP2: ${round(bal*0.005,2)}\n"
+        f"\n"
+        f"*SAR:* SET → ADJUST → RUN",
         parse_mode="Markdown"
     )
 
@@ -1783,7 +1788,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Error: {context.error}")
     try:
         if update and hasattr(update, "message") and update.message:
-            await update.message.reply_text(f"⚠️ Error. Try /quick.\n`{str(context.error)[:100]}`", parse_mode="Markdown")
+            # Send plain text (no markdown) to avoid recursive parse errors
+            await update.message.reply_text(
+                f"⚠️ Error. Try /quick.\n{str(context.error)[:120]}"
+            )
     except Exception:
         pass
 
