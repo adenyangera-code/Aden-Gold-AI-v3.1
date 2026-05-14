@@ -1,15 +1,16 @@
 """
-ADEN GOLD AI BOT v4.2
+ADEN GOLD AI BOT v4.3
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Changes from v4.1:
-  + /logwin [amount]   — log winning trade
-  + /logloss [amount]  — log losing trade
-  + /today             — today's W/L count + P&L
-  + /setunit [value]   — change PIP_VALUE on the fly
-  + JSON-persisted trade log (survives Render restarts)
-  + Auto-warning banner after 2 losses on every signal
-  + Loss counter auto-resets at midnight SGT
-  + Version labels unified to v4.2
+Changes from v4.2:
+  + /pattern           — weekday P&L breakdown from trade log
+  + Rule 15            — Thursday HALF DAY rule
+  + Thursday banner    — auto-warning on every Thu signal
+  + Smarter rule list  — 15 rules now
+
+Inherited from v4.2:
+  + /logwin, /logloss, /today, /setunit
+  + JSON-persisted trade log
+  + Rule 7 auto-warning after 2 losses
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 import asyncio
@@ -135,6 +136,57 @@ def get_loss_warning() -> str:
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
         )
     return ""
+
+
+def get_thursday_warning() -> str:
+    """Return Thursday banner if it's Thursday. Based on journal data:
+    Thursdays = -$478.91 total (avg -$95.78/day, 1/5 win-day rate)."""
+    now = datetime.now(SGT)
+    if now.weekday() != 3:  # 0=Mon, 3=Thu
+        return ""
+    hour = now.hour
+    # Danger window: 8-10PM SGT (US jobless claims @ 8:30PM)
+    if 20 <= hour < 22:
+        return (
+            f"🔴 *RULE 15 — THURSDAY DANGER ZONE*\n"
+            f"_8-10PM = US Jobless Claims window._\n"
+            f"_Journal data: Thursdays lose $96/day on avg._\n"
+            f"_Consider WAITING for data to settle._\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+    # General Thursday warning
+    return (
+        f"⚠️ *RULE 15 — THURSDAY HALF DAY*\n"
+        f"_Thursdays lose $96/day on avg (1/5 wins)._\n"
+        f"_Use 50% position size. No overnight._\n"
+        f"_Run /news before any trade._\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+    )
+
+
+def get_weekday_pattern() -> dict:
+    """Aggregate full trade log by weekday. Returns stats dict."""
+    log = load_trade_log()
+    weekday_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    stats = {name: {"days": 0, "pnl": 0.0, "wins": 0, "losses": 0,
+                    "win_days": 0, "loss_days": 0} for name in weekday_names}
+
+    for date_str, entry in log.items():
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            name = weekday_names[dt.weekday()]
+            s = stats[name]
+            s["days"] += 1
+            s["pnl"] += entry.get("pnl", 0)
+            s["wins"] += entry.get("wins", 0)
+            s["losses"] += entry.get("losses", 0)
+            if entry.get("pnl", 0) > 0:
+                s["win_days"] += 1
+            elif entry.get("pnl", 0) < 0:
+                s["loss_days"] += 1
+        except Exception as e:
+            logger.warning(f"Pattern parse failed for {date_str}: {e}")
+    return stats
 
 
 # ── MOTIVATION QUOTES ──────────────────────────────────────────────────────────
@@ -847,7 +899,7 @@ Return ONLY valid JSON:
 
 # ── FORMAT SIGNAL ──────────────────────────────────────────────────────────────
 def format_signal(a: dict, source="AI", sma: dict = None) -> str:
-    warning_banner = get_loss_warning()
+    warning_banner = get_loss_warning() + get_thursday_warning()
     e = {"BUY": "🟢", "SELL": "🔴", "WAIT": "🟡"}.get(a.get("signal", "WAIT"), "⚪")
     d = "📉" if a.get("dxy_trend") == "falling" else "📈" if a.get("dxy_trend") == "rising" else "➖"
     ti = lambda t: "🟢" if t == "bullish" else "🔴" if t == "bearish" else "🟡"
@@ -861,7 +913,7 @@ def format_signal(a: dict, source="AI", sma: dict = None) -> str:
     if a.get("signal") == "WAIT":
         return (
             f"{warning_banner}"
-            f"⚖️ *ADEN GOLD AI v4.2 — {source}*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚖️ *ADEN GOLD AI v4.3 — {source}*\n━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🟡 *WAIT* | 💰 ${a.get('price','—')}\n{sb} {sc}/100\n"
             f"{si} {a.get('session','—')}\n"
             f"{sma_block}\n\n"
@@ -879,7 +931,7 @@ def format_signal(a: dict, source="AI", sma: dict = None) -> str:
 
     return (
         f"{warning_banner}"
-        f"⚖️ *ADEN GOLD AI v4.2 — {source}*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚖️ *ADEN GOLD AI v4.3 — {source}*\n━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{e} *{a.get('signal','—')}* | 💰 ${a.get('price','—')}\n{sb} {sc}/100\n"
         f"{si} {a.get('session','—')}\n"
         f"{sma_block}\n\n"
@@ -908,7 +960,7 @@ def format_signal(a: dict, source="AI", sma: dict = None) -> str:
 
 # ── FORMAT CROSS-CHECK ─────────────────────────────────────────────────────────
 def format_crosscheck(a: dict) -> str:
-    warning_banner = get_loss_warning()
+    warning_banner = get_loss_warning() + get_thursday_warning()
     ve = {"CONFIRMED": "✅", "MIXED": "⚠️", "REJECTED": "❌"}.get(a.get("verdict", "MIXED"), "❓")
     ae = "🟢" if a.get("ai_direction") == "BUY" else "🔴" if a.get("ai_direction") == "SELL" else "🟡"
     se = "🟢" if a.get("source_direction") == "BUY" else "🔴" if a.get("source_direction") == "SELL" else "🟡"
@@ -921,7 +973,7 @@ def format_crosscheck(a: dict) -> str:
 
     return (
         f"{warning_banner}"
-        f"🔄 *SIGNAL CROSS-CHECK v4.2*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔄 *SIGNAL CROSS-CHECK v4.3*\n━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{ve} *{a.get('verdict','—')}* | {sb} {a.get('confidence',0)}%\n\n"
         f"📨 *Source ({a.get('source_name','Unknown')}):*\n"
         f"{se} {a.get('source_direction','—')} | Entry:${a.get('source_entry','—')} SL:${a.get('source_sl','—')} TP:${a.get('source_tp','—')}\n\n"
@@ -1049,7 +1101,7 @@ Return ONLY valid JSON:
 
 
 def format_personal_analysis(a: dict, parsed: dict) -> str:
-    warning_banner = get_loss_warning()
+    warning_banner = get_loss_warning() + get_thursday_warning()
     ts = get_session_label()
     ve = {"CONFIRMED": "✅", "MIXED": "⚠️", "REJECTED": "❌"}.get(a.get("verdict", "MIXED"), "❓")
     chk = lambda x: "✅" if x else "❌"
@@ -1058,7 +1110,7 @@ def format_personal_analysis(a: dict, parsed: dict) -> str:
 
     return (
         f"{warning_banner}"
-        f"🎯 *ADEN'S ANALYSIS REVIEW v4.2*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 *ADEN'S ANALYSIS REVIEW v4.3*\n━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{ve} *{a.get('verdict','—')}* | {agree_bar} {a.get('agreement_pct',0)}% agree\n\n"
         f"*Your Setup:*\n"
         f"{'🟢' if parsed['direction']=='BUY' else '🔴'} {parsed['direction']} "
@@ -1095,7 +1147,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bal = runtime_balance["value"]
     pip = runtime_pip["value"]
     await update.message.reply_text(
-        f"⚖️ *ADEN GOLD AI BOT v4.2*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚖️ *ADEN GOLD AI BOT v4.3*\n━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 SMA + RSI + MACD + Bollinger + Fib\n"
         f"🕯️ Candlestick pattern detection\n"
         f"💰 Live: OANDA + gold-api + Yahoo Finance\n"
@@ -1113,10 +1165,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"/setunit [pip] — Change pip value\n"
         f"/today — Today's W/L + P&L\n"
         f"/logwin [amt] — Log winning trade\n"
-        f"/logloss [amt] — Log losing trade\n\n"
+        f"/logloss [amt] — Log losing trade\n"
+        f"/pattern — Weekday breakdown 🆕\n\n"
         f"*Reference:*\n"
         f"/crossref — Forward signal guide\n"
-        f"/rules — Trading rules\n"
+        f"/rules — Trading rules (15 rules!)\n"
         f"/status — Bot status\n\n"
         f"*Signal Channels (forward to bot):*\n"
         f"📊 United Signals | SureShotFX\n"
@@ -1389,7 +1442,82 @@ async def cmd_logloss(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Use: `/logloss 20.00`", parse_mode="Markdown")
 
 
-async def cmd_crossref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_pattern(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show weekday P&L breakdown from full trade log."""
+    stats = get_weekday_pattern()
+    weekday_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    # Check if we have any data
+    total_days = sum(s["days"] for s in stats.values())
+    if total_days == 0:
+        await update.message.reply_text(
+            "📊 *No pattern data yet.*\n"
+            "Log trades with /logwin and /logloss first.\n"
+            "Pattern unlocks after a few days of data.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Build the table
+    lines = ["📊 *WEEKDAY PATTERN ANALYSIS*", "━━━━━━━━━━━━━━━━━━━━━━"]
+    lines.append(f"```")
+    lines.append(f"Day  Days  Net P&L     Avg/Day   W/L Days")
+    lines.append(f"---  ----  ---------   --------  --------")
+
+    # Order by P&L worst to best, then show
+    ordered = sorted(
+        [(name, stats[name]) for name in weekday_names if stats[name]["days"] > 0],
+        key=lambda x: x[1]["pnl"]
+    )
+
+    total_pnl = 0
+    worst_day = None
+    best_day = None
+    for name, s in ordered:
+        if s["days"] == 0:
+            continue
+        avg = s["pnl"] / s["days"]
+        total_pnl += s["pnl"]
+        if worst_day is None or s["pnl"] < worst_day[1]["pnl"]:
+            worst_day = (name, s)
+        if best_day is None or s["pnl"] > best_day[1]["pnl"]:
+            best_day = (name, s)
+        lines.append(
+            f"{name}  {s['days']:>4}  ${s['pnl']:>+8.2f}  ${avg:>+7.2f}  {s['win_days']}W/{s['loss_days']}L"
+        )
+
+    lines.append(f"```")
+    lines.append(f"")
+    lines.append(f"💼 *Total Net P&L:* ${total_pnl:+.2f}")
+    lines.append(f"")
+
+    # Worst day callout
+    if worst_day and worst_day[1]["pnl"] < 0:
+        wname, ws = worst_day
+        wavg = ws["pnl"] / ws["days"]
+        lines.append(f"🔴 *Worst Day: {wname}*")
+        lines.append(f"_${ws['pnl']:+.2f} across {ws['days']} {wname}s "
+                     f"({100*ws['win_days']/ws['days']:.0f}% win rate)_")
+        if wname == "Thu":
+            lines.append(f"_→ Rule 15 active — Thursday is HALF DAY!_")
+        lines.append(f"")
+
+    # Best day callout
+    if best_day and best_day[1]["pnl"] > 0:
+        bname, bs = best_day
+        bavg = bs["pnl"] / bs["days"]
+        lines.append(f"🟢 *Best Day: {bname}*")
+        lines.append(f"_${bs['pnl']:+.2f} across {bs['days']} {bname}s_")
+        lines.append(f"_→ Concentrate position size on {bname}s_")
+        lines.append(f"")
+
+    lines.append(f"⏰ {sgt_now()}")
+    lines.append(f"_Data updates as you /logwin and /logloss_")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+
     await update.message.reply_text(
         "📨 *Cross-Reference:*\n\n"
         "1. Open signal channel\n2. Long press message\n"
@@ -1404,20 +1532,30 @@ async def cmd_rules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bal = runtime_balance["value"]
     r = calculate_risk()
     await update.message.reply_text(
-        f"📋 *ADEN'S RULES v4.2*\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"★ SL BEFORE entry always!\n"
-        f"★ Structure SL + {SL_BUFFER_PIPS} pip buffer\n"
-        f"★ AI bot + own chart = both confirm\n"
-        f"★ Check SMA crossover — no false breakout!\n"
-        f"★ Max loss/trade: ${r['max_loss']} ({MAX_RISK_PCT}%)\n"
-        f"★ TP1 at 0.3% = ${round(bal*0.003,2)}\n"
-        f"★ TP2 at 0.5% = ${round(bal*0.005,2)}\n"
-        f"★ Daily target 0.7-1% = ${round(bal*0.007,2)}-${round(bal*0.01,2)}\n"
-        f"★ 2 losses = STOP today! (auto-warning on)\n"
-        f"★ Target hit = LOG OFF!\n"
-        f"★ Gold only — no USD/JPY!\n"
-        f"★ Score >= 70 to trade!\n"
-        f"★ London+NY sessions only!\n\n"
+        f"📋 *ADEN'S RULES v4.3*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"★ R1: Gold only — no USD/JPY (intervention!)\n"
+        f"★ R2: SL BEFORE entry always\n"
+        f"★ R3: Structure SL + {SL_BUFFER_PIPS} pip buffer\n"
+        f"★ R4: Never average down\n"
+        f"★ R5: Partial closes lock profit\n"
+        f"★ R6: No trading before major news\n"
+        f"★ R7: 2 losses = STOP! (auto-warning on)\n"
+        f"★ R8: Small wins compound\n"
+        f"★ R9: AI bot + own chart = both confirm\n"
+        f"★ R10: Score ≥ 70 to trade\n"
+        f"★ R11: London + NY only (3-11PM SGT)\n"
+        f"★ R12: Low confidence = skip\n"
+        f"★ R13: Daily target 0.7-1% = ${round(bal*0.007,2)}-${round(bal*0.01,2)}\n"
+        f"★ R14: Take profit at 0.3%, 0.5%, 1% — never wait\n"
+        f"🔴 *R15: THURSDAY HALF DAY* (NEW!)\n"
+        f"    • No trading 8-10PM SGT (Jobless Claims)\n"
+        f"    • No overnight Thu→Fri positions\n"
+        f"    • 50% position size on Thursdays\n"
+        f"    • Mandatory /news check before any trade\n"
+        f"    • _Journal data: Thursdays lose $96/day avg_\n\n"
+        f"💰 *RISK:*\n"
+        f"Max loss/trade: ${r['max_loss']} ({MAX_RISK_PCT}%)\n"
+        f"TP1: ${round(bal*0.003,2)} | TP2: ${round(bal*0.005,2)}\n\n"
         f"*SAR:* SET → ADJUST → RUN\n"
         f"_Small profits compound to millions!_ 💪",
         parse_mode="Markdown"
@@ -1427,7 +1565,7 @@ async def cmd_rules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     today = get_today_log()
     await update.message.reply_text(
-        f"🤖 *BOT STATUS v4.2*\n━━━━━━━━━━━━━━\n"
+        f"🤖 *BOT STATUS v4.3*\n━━━━━━━━━━━━━━\n"
         f"✅ Online | ⏰ {sgt_now()}\n"
         f"💼 Balance: ${runtime_balance['value']:,.2f}\n"
         f"📐 Pip value: ${runtime_pip['value']}\n"
@@ -1676,6 +1814,7 @@ def main():
     app.add_handler(CommandHandler("crossref",   cmd_crossref))
     app.add_handler(CommandHandler("rules",      cmd_rules))
     app.add_handler(CommandHandler("status",     cmd_status))
+    app.add_handler(CommandHandler("pattern",    cmd_pattern))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
@@ -1689,7 +1828,7 @@ def main():
     jq.run_daily(job_eod_check,      time=dt.time(15,  0, 0))  # 11PM SGT
     jq.run_daily(job_midnight_reset, time=dt.time(16,  0, 0))  # 12AM SGT — new day
 
-    logger.info("⚖️ Aden Gold AI Bot v4.2 started!")
+    logger.info("⚖️ Aden Gold AI Bot v4.3 started!")
     logger.info(f"⏰ {sgt_now()} | Balance: ${runtime_balance['value']} | Pip: ${runtime_pip['value']}")
     logger.info(f"📂 Trade log: {TRADE_LOG_FILE}")
     app.run_polling(drop_pending_updates=True)
