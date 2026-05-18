@@ -302,7 +302,11 @@ def sgt_full() -> str:
 
 
 def get_session_label(news_filter: bool = False, risk_level: str = "") -> str:
-    """Returns time + session quality label + news risk override"""
+    """Returns time + session quality label + news risk override.
+
+    Uses actual London/NY local hours via pytz so DST is handled automatically.
+    Old version hardcoded ET-style hour numbers against SGT clock — see v4.3 fix.
+    """
     now = datetime.now(SGT)
     hour = now.hour
     minute = now.minute
@@ -315,6 +319,7 @@ def get_session_label(news_filter: bool = False, risk_level: str = "") -> str:
     if risk_level == "HIGH":
         return f"{time_str} | 🔴 HIGH IMPACT NEWS TODAY — be very careful!"
 
+    # News event zones (SGT)
     if weekday == 4 and hour == 20 and minute >= 15:
         return f"{time_str} | 💥 NFP ZONE — avoid until settled!"
     if weekday == 3 and hour == 20 and 15 <= minute <= 45:
@@ -322,30 +327,32 @@ def get_session_label(news_filter: bool = False, risk_level: str = "") -> str:
     if weekday == 2 and hour == 20 and 0 <= minute <= 30:
         return f"{time_str} | ⚠️ ADP Data zone — caution!"
 
-    if hour == 3 and minute < 30:
-        label = "🟢 London Open — prime window!"
-    elif 3 <= hour < 5:
-        label = "🟢 London session — good"
-    elif hour == 5:
-        label = "⚠️ London lunch — low volume"
-    elif 5 <= hour < 7:
-        label = "⚠️ Quiet period — be careful"
-    elif 7 <= hour < 8:
-        label = "🟢 London afternoon — good"
-    elif hour == 7 and minute >= 30:
-        label = "🟡 Pre-NY — wait for open"
-    elif hour == 8 and minute < 30:
-        label = "💎 NY Open — best window!"
-    elif 8 <= hour < 11:
+    # Get actual local hours in London + NY (DST handled by pytz)
+    london_hour = datetime.now(pytz.timezone("Europe/London")).hour
+    ny_hour = datetime.now(pytz.timezone("America/New_York")).hour
+    london_open = 8 <= london_hour < 17    # 8 AM – 5 PM London local
+    ny_open = 8 <= ny_hour < 17            # 8 AM – 5 PM NY local
+
+    if london_open and ny_open:
         label = "💎 NY+London overlap — GOLDEN!"
-    elif hour == 10 and minute >= 30:
-        label = "🟡 London closing — reduce size"
-    elif 11 <= hour < 12:
-        label = "🔴 Post-overlap — stop soon"
-    elif 12 <= hour < 15:
-        label = "🔴 Asian session — avoid"
+    elif ny_open and ny_hour < 10:
+        label = "💎 NY Open — best window!"
+    elif ny_open and ny_hour >= 14:
+        label = "🟡 NY afternoon — fading"
+    elif ny_open:
+        label = "🟢 NY session — active"
+    elif london_open and london_hour < 10:
+        label = "🟢 London Open — prime window!"
+    elif london_open and london_hour == 12:
+        label = "⚠️ London lunch — low volume"
+    elif london_open and london_hour >= 14:
+        label = "🟢 London afternoon — good"
+    elif london_open:
+        label = "🟢 London session — good"
+    elif 8 <= hour < 15:
+        label = "⚠️ Asia session — gold quiet"
     else:
-        label = "🔴 Low volume — wait for London"
+        label = "🔴 Off-hours — avoid trading"
 
     return f"{time_str} | {label}"
 
